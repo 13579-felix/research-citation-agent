@@ -1,7 +1,10 @@
+import logging
+
 import requests
 
 _API = "https://api.semanticscholar.org/graph/v1/paper/search"
 _FIELDS = "title,authors,year,venue,abstract,url"
+_logger = logging.getLogger("citation_search")
 
 
 def search_papers(query: str, limit: int = 3) -> list[dict]:
@@ -14,7 +17,8 @@ def search_papers(query: str, limit: int = 3) -> list[dict]:
             timeout=10,
         )
         resp.raise_for_status()
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        _logger.warning("semantic scholar request failed for %r: %s", query, exc)
         return []
 
     data = resp.json().get("data", [])
