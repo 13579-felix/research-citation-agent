@@ -20,7 +20,7 @@ function paperHTML(p) {
   return `
     <div class="paper">
       <a href="${p.url || "#"}" target="_blank" rel="noopener">${p.title}</a>
-      <div class="paper-meta">${authors} · ${p.year ?? "연도 미상"} ${p.venue ? "· " + p.venue : ""}</div>
+      <div class="paper-meta">${authors} · ${p.year ?? "연도 미상"} ${p.venue ? "· " + p.venue : ""} · ${p.provider}</div>
     </div>`;
 }
 

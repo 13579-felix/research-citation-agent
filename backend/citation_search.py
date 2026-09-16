@@ -1,56 +1,97 @@
 import logging
 import os
-import time
+import xml.etree.ElementTree as ET
 
 import requests
 
-_API = "https://api.semanticscholar.org/graph/v1/paper/search"
-_FIELDS = "title,authors,year,venue,abstract,url"
+_OPENALEX_API = "https://api.openalex.org/works"
+_ARXIV_API = "http://export.arxiv.org/api/query"
+_ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
 _logger = logging.getLogger("citation_search")
 
 
-def _headers() -> dict:
-    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
-    return {"x-api-key": api_key} if api_key else {}
+def _reconstruct_abstract(inverted_index: dict | None) -> str:
+    if not inverted_index:
+        return ""
+    positions = {}
+    for word, idxs in inverted_index.items():
+        for i in idxs:
+            positions[i] = word
+    return " ".join(positions[i] for i in sorted(positions))[:400]
 
 
-def search_papers(query: str, limit: int = 3) -> list[dict]:
+def search_openalex(query: str, limit: int = 2) -> list[dict]:
     if not query.strip():
         return []
-
-    resp = None
-    for attempt in range(3):
-        try:
-            resp = requests.get(
-                _API,
-                params={"query": query, "limit": limit, "fields": _FIELDS},
-                headers=_headers(),
-                timeout=10,
-            )
-            if resp.status_code == 429:
-                _logger.warning("semantic scholar rate-limited (attempt %d) for %r", attempt + 1, query)
-                time.sleep(2 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            break
-        except requests.RequestException as exc:
-            _logger.warning("semantic scholar request failed for %r: %s", query, exc)
-            return []
-    else:
+    params = {"search": query, "per_page": limit}
+    mailto = os.environ.get("OPENALEX_MAILTO")
+    if mailto:
+        params["mailto"] = mailto
+    try:
+        resp = requests.get(_OPENALEX_API, params=params, timeout=10)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        _logger.warning("openalex request failed for %r: %s", query, exc)
         return []
 
-    data = resp.json().get("data", [])
     papers = []
-    for p in data:
-        authors = [a.get("name", "") for a in (p.get("authors") or [])]
+    for w in resp.json().get("results", []):
+        authors = [
+            a.get("author", {}).get("display_name", "")
+            for a in w.get("authorships", [])
+        ]
+        source = w.get("primary_location") or {}
         papers.append(
             {
-                "title": p.get("title") or "(제목 없음)",
+                "title": w.get("display_name") or "(제목 없음)",
                 "authors": authors,
-                "year": p.get("year"),
-                "venue": p.get("venue") or "",
-                "abstract": p.get("abstract") or "",
-                "url": p.get("url") or "",
+                "year": w.get("publication_year"),
+                "venue": (source.get("source") or {}).get("display_name") or "",
+                "abstract": _reconstruct_abstract(w.get("abstract_inverted_index")),
+                "url": source.get("landing_page_url") or w.get("doi") or "",
+                "provider": "OpenAlex",
             }
         )
     return papers
+
+
+def search_arxiv(query: str, limit: int = 2) -> list[dict]:
+    if not query.strip():
+        return []
+    params = {"search_query": f"all:{query}", "max_results": limit}
+    try:
+        resp = requests.get(_ARXIV_API, params=params, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except (requests.RequestException, ET.ParseError) as exc:
+        _logger.warning("arxiv request failed for %r: %s", query, exc)
+        return []
+
+    papers = []
+    for entry in root.findall("atom:entry", _ARXIV_NS):
+        title_el = entry.find("atom:title", _ARXIV_NS)
+        summary_el = entry.find("atom:summary", _ARXIV_NS)
+        published_el = entry.find("atom:published", _ARXIV_NS)
+        id_el = entry.find("atom:id", _ARXIV_NS)
+        authors = [
+            a.findtext("atom:name", default="", namespaces=_ARXIV_NS)
+            for a in entry.findall("atom:author", _ARXIV_NS)
+        ]
+        papers.append(
+            {
+                "title": (title_el.text or "").strip().replace("\n", " ") if title_el is not None else "(제목 없음)",
+                "authors": authors,
+                "year": int(published_el.text[:4]) if published_el is not None and published_el.text else None,
+                "venue": "arXiv",
+                "abstract": (summary_el.text or "").strip().replace("\n", " ")[:400] if summary_el is not None else "",
+                "url": id_el.text if id_el is not None else "",
+                "provider": "arXiv",
+            }
+        )
+    return papers
+
+
+def search_papers(query: str, limit: int = 4) -> list[dict]:
+    per_source = max(1, (limit + 1) // 2)
+    papers = search_openalex(query, per_source) + search_arxiv(query, per_source)
+    return papers[:limit]

@@ -3,8 +3,8 @@
 AI+X 1차 과제 프로젝트: **연구 글쓰기용 선행연구 인용 자동 매칭 및 근거 보완 Agentic AI**
 
 연구 배경 문단이나 논문/연구계획서 초안을 입력하면 문장 단위로 주장을 추출하고,
-[Semantic Scholar](https://www.semanticscholar.org/) API에서 관련 선행연구를 검색해
-근거를 매칭합니다. `ANTHROPIC_API_KEY`를 설정하면 Claude가 검색어 생성과
+[OpenAlex](https://openalex.org/)와 [arXiv](https://arxiv.org/) API에서 관련 선행연구를 검색해
+근거를 매칭합니다 (둘 다 API 키 없이 무료로 사용 가능). `ANTHROPIC_API_KEY`를 설정하면 Claude가 검색어 생성과
 "근거가 충분한지" 판단까지 수행하는 Agentic 모드로 동작하고, 키가 없으면
 영문 전문용어 추출 기반 휴리스틱으로 동작합니다 (예: FeFET, HZO, TiN capping 같은
 재료·소자 연구의 영문 전문용어를 문장에서 뽑아 검색어로 사용).
@@ -41,7 +41,7 @@ backend/
   app.py               FastAPI 엔트리포인트, /api/analyze
   agent.py             문장별 검색어 생성 + 근거 충분성 판단 (Claude 또는 휴리스틱)
   claim_extractor.py   초안 텍스트를 문장 단위 주장으로 분리
-  citation_search.py   Semantic Scholar API 래퍼
+  citation_search.py   OpenAlex + arXiv API 래퍼
 frontend/
   index.html, app.js, style.css   단순 정적 웹 UI
 ```

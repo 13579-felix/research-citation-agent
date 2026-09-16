@@ -39,7 +39,7 @@ def _refine_query_with_claude(sentence: str, fallback_query: str) -> str:
                     "role": "user",
                     "content": (
                         "다음은 연구 글쓰기 초안의 한 문장이다. 이 문장의 주장을 "
-                        "뒷받침할 선행연구를 학술 검색엔진(Semantic Scholar)에서 "
+                        "뒷받침할 선행연구를 학술 검색엔진(OpenAlex, arXiv)에서 "
                         "찾기 위한 영어 검색 쿼리를 3~6개 키워드로만 출력하라. "
                         "다른 설명 없이 쿼리만 출력할 것.\n\n"
                         f"문장: {sentence}"
