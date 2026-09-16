@@ -10,3 +10,5 @@ services:
         sync: false
       - key: ANTHROPIC_MODEL
         value: claude-sonnet-5
+      - key: SEMANTIC_SCHOLAR_API_KEY
+        sync: false
