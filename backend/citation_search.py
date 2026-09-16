@@ -21,7 +21,12 @@ def search_papers(query: str, limit: int = 3) -> list[dict]:
         _logger.warning("semantic scholar request failed for %r: %s", query, exc)
         return []
 
-    data = resp.json().get("data", [])
+    body = resp.json()
+    data = body.get("data", [])
+    _logger.warning(
+        "semantic scholar query=%r status=%s total=%s returned=%d",
+        query, resp.status_code, body.get("total"), len(data),
+    )
     papers = []
     for p in data:
         authors = [a.get("name", "") for a in (p.get("authors") or [])]

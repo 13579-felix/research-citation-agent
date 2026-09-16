@@ -1,7 +1,9 @@
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+logging.basicConfig(level=logging.INFO)
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from fastapi import FastAPI
