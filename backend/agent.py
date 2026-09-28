@@ -30,12 +30,17 @@ from claim_extractor import build_query, looks_self_referential, split_sentences
 # Override with GEMINI_MODEL to pin a specific version.
 _GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 _MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "30"))
-_SENTENCE_WORKERS = 4
+_SEARCH_WORKERS = 4
+# The Gemini free tier allows ~5 requests/minute, so sentences are sent to
+# the model in batches (1 planning call + 1 judging call per batch) instead
+# of 2 calls per sentence.
+_JUDGE_BATCH = 10
 _gemini_client = None
 _logger = logging.getLogger("agent")
 
 
 class CitationPlan(BaseModel):
+    index: int = Field(description="The sentence number given in the input")
     needs_citation: bool = Field(
         description="True if the sentence states a fact/result from prior literature that a reader would expect to be cited."
     )
@@ -43,11 +48,20 @@ class CitationPlan(BaseModel):
     query: str = Field(description="English search query, 3-6 specific technical keywords. Empty if needs_citation is false.")
 
 
+class CitationPlans(BaseModel):
+    plans: list[CitationPlan]
+
+
 class Judgement(BaseModel):
+    index: int = Field(description="The claim number given in the input")
     verdict: Literal["supported", "contradicted", "insufficient"]
     reason: str = Field(description="한국어 1~2문장. 어떤 논문의 어떤 내용 때문인지 구체적으로.")
-    supporting: list[int] = Field(description="1-based indices of papers that support the claim")
-    contradicting: list[int] = Field(description="1-based indices of papers that contradict the claim")
+    supporting: list[int] = Field(description="1-based indices of this claim's papers that support it")
+    contradicting: list[int] = Field(description="1-based indices of this claim's papers that contradict it")
+
+
+class Judgements(BaseModel):
+    judgements: list[Judgement]
 
 
 def _get_client():
@@ -68,7 +82,7 @@ def _get_client():
             timeout=60_000,  # ms
             # The free tier has a low requests-per-minute cap; back off on 429.
             retry_options=types.HttpRetryOptions(
-                attempts=4, initial_delay=2.0, max_delay=30.0, http_status_codes=[429, 500, 503]
+                attempts=3, initial_delay=5.0, max_delay=40.0, http_status_codes=[429, 500, 503]
             ),
         ),
     )
@@ -95,31 +109,38 @@ def _parse(client, schema: type[BaseModel], prompt: str):
     return response.parsed
 
 
-def _plan_with_llm(client, sentence: str) -> CitationPlan:
-    return _parse(
+def _plan_with_llm(client, sentences: list[str]) -> dict[int, CitationPlan]:
+    numbered = "\n".join(f"[{i}] {sent}" for i, sent in enumerate(sentences, 1))
+    result = _parse(
         client,
-        CitationPlan,
-        "다음은 연구 글(논문/연구계획서) 초안의 한 문장이다.\n"
+        CitationPlans,
+        "다음은 연구 글(논문/연구계획서) 초안의 문장 목록이다. 각 문장마다 번호(index)를 그대로 써서 답하라.\n"
         "1) 이 문장이 선행연구 인용이 필요한 주장인지 판단하라. 기존 문헌의 사실·결과·수치를 "
         "서술하면 인용이 필요하다. 본 연구의 목적·방법·계획을 서술하거나, 글의 구성을 안내하는 "
         "문장은 인용이 필요 없다.\n"
         "2) 인용이 필요하면, OpenAlex/Crossref/arXiv에서 이 주장을 검증할 논문을 찾기 위한 "
         "영어 검색 쿼리(구체적인 재료·소자·공정 용어 3~6개)를 만들어라. 'Si', 'Zr' 같은 "
         "단일 원소 기호만으로 된 일반적인 쿼리는 피하라.\n\n"
-        f"문장: {sentence}",
+        f"문장 목록:\n{numbered}",
     )
+    return {plan.index: plan for plan in result.plans}
 
 
-def _judge_with_llm(client, sentence: str, papers: list[dict]) -> Judgement:
-    paper_block = "\n\n".join(
-        f"[{i}] {p['title']} ({p['year'] or '연도 미상'}, {p['venue'] or p['provider']})\n"
-        f"초록: {p['abstract'] or '(초록 없음 — 제목만으로는 근거로 인정하지 말 것)'}"
-        for i, p in enumerate(papers, 1)
-    )
-    return _parse(
+def _judge_with_llm(client, claims: list[tuple[str, list[dict]]]) -> dict[int, Judgement]:
+    blocks = []
+    for i, (sentence, papers) in enumerate(claims, 1):
+        paper_block = "\n".join(
+            f"  ({j}) {p['title']} ({p['year'] or '연도 미상'}, {p['venue'] or p['provider']})\n"
+            f"      초록: {p['abstract'] or '(초록 없음 — 제목만으로는 근거로 인정하지 말 것)'}"
+            for j, p in enumerate(papers, 1)
+        )
+        blocks.append(f"### 주장 [{i}]: {sentence}\n후보 논문:\n{paper_block}")
+    result = _parse(
         client,
-        Judgement,
-        "너는 연구 글의 인용 근거를 검증하는 심사자다. 아래 주장 문장과 후보 논문(초록 전문)을 대조하라.\n\n"
+        Judgements,
+        "너는 연구 글의 인용 근거를 검증하는 심사자다. 각 주장 문장을 그 주장에 딸린 후보 논문"
+        "(초록 전문)과 대조하라. 주장마다 번호(index)를 그대로 써서 하나씩 판정하고, 논문 번호는 "
+        "그 주장 안에서의 번호를 쓴다.\n\n"
         "판정 기준:\n"
         "- supported: 적어도 한 논문의 초록이 이 주장의 핵심 내용(대상 재료·소자, 조건, 방향, "
         "수치)을 직접 뒷받침한다.\n"
@@ -129,8 +150,9 @@ def _judge_with_llm(client, sentence: str, papers: list[dict]) -> Judgement:
         "- insufficient: 주제는 관련 있어도 주장의 구체적 내용(특히 수치·조건)을 확인할 수 없다. "
         "키워드만 겹치는 논문, 다른 재료계 논문, 초록이 없는 논문은 근거가 아니다.\n"
         "확신이 없으면 supported가 아니라 insufficient로 판정하라.\n\n"
-        f"주장: {sentence}\n\n후보 논문:\n{paper_block}",
+        + "\n\n".join(blocks),
     )
+    return {j.index: j for j in result.judgements}
 
 
 def _result(sentence, query, papers, status, reason, search_status=None, supporting=(), contradicting=()):
@@ -159,6 +181,15 @@ def _no_papers(sentence: str, query: str, search_status: dict) -> dict:
     return _result(sentence, query, [], "insufficient", "관련 후보 논문을 찾지 못했습니다.", search_status)
 
 
+def _llm_error(exc: Exception) -> str:
+    text = str(exc)
+    if "RESOURCE_EXHAUSTED" in text or "429" in text[:5]:
+        return "Gemini 무료 요청 한도를 초과했습니다. 1분쯤 뒤 다시 시도하세요"
+    if "UNAVAILABLE" in text or "503" in text[:5]:
+        return "Gemini 서버가 혼잡합니다. 잠시 뒤 다시 시도하세요"
+    return text[:150]
+
+
 def _analyze_heuristic(sentence: str) -> dict:
     if looks_self_referential(sentence):
         return _result(sentence, "", [], "not_needed", "본 연구 서술로 보여 검색하지 않았습니다 (휴리스틱).")
@@ -179,41 +210,67 @@ def _analyze_heuristic(sentence: str) -> dict:
     )
 
 
-def _analyze_agentic(client, sentence: str) -> dict:
-    try:
-        plan = _plan_with_llm(client, sentence)
-    except Exception as exc:
-        _logger.warning("citation planning failed for %r: %s", sentence, exc)
-        plan = None
-
-    if plan is not None and not plan.needs_citation:
-        return _result(sentence, "", [], "not_needed", plan.reason)
-
-    query = (plan.query.strip() if plan else "") or build_query(sentence)
-    if not query:
-        return _result(sentence, "", [], "error", "검색어를 생성하지 못해 판단할 수 없습니다.")
-
-    papers, search_status = search_papers(query)
+def _search_for(sentence: str, plan: CitationPlan | None):
+    """Returns (query, papers, search_status)."""
     fallback = build_query(sentence)
+    query = (plan.query.strip() if plan else "") or fallback
+    if not query:
+        return "", [], {}
+    papers, search_status = search_papers(query)
     if not papers and fallback and fallback != query:
         query = fallback
         papers, search_status = search_papers(query)
-    if not papers:
-        return _no_papers(sentence, query, search_status)
+    return query, papers, search_status
 
+
+def _analyze_agentic(client, sentences: list[str]) -> list[dict]:
     try:
-        judgement = _judge_with_llm(client, sentence, papers)
+        plans = _plan_with_llm(client, sentences)
     except Exception as exc:
-        _logger.warning("judgement failed for %r: %s", sentence, exc)
-        return _result(
-            sentence, query, papers, "error",
-            f"근거 판단에 실패했습니다 ({str(exc)[:150]}). 후보 논문을 직접 확인하세요.",
-            search_status,
-        )
-    return _result(
-        sentence, query, papers, judgement.verdict, judgement.reason, search_status,
-        supporting=set(judgement.supporting), contradicting=set(judgement.contradicting),
-    )
+        # Keep going with heuristic queries; the judge step still decides.
+        _logger.warning("citation planning failed: %s", exc)
+        plans = {}
+
+    results: list[dict | None] = [None] * len(sentences)
+    to_search = []
+    for i, sentence in enumerate(sentences):
+        plan = plans.get(i + 1)
+        if plan is not None and not plan.needs_citation:
+            results[i] = _result(sentence, "", [], "not_needed", plan.reason)
+        else:
+            to_search.append((i, sentence, plan))
+
+    with ThreadPoolExecutor(max_workers=_SEARCH_WORKERS) as pool:
+        searched = list(pool.map(lambda item: (item[0], item[1], *_search_for(item[1], item[2])), to_search))
+
+    to_judge = []
+    for i, sentence, query, papers, search_status in searched:
+        if not query:
+            results[i] = _result(sentence, "", [], "error", "검색어를 생성하지 못해 판단할 수 없습니다.")
+        elif not papers:
+            results[i] = _no_papers(sentence, query, search_status)
+        else:
+            to_judge.append((i, sentence, query, papers, search_status))
+
+    for start in range(0, len(to_judge), _JUDGE_BATCH):
+        batch = to_judge[start:start + _JUDGE_BATCH]
+        try:
+            judgements = _judge_with_llm(client, [(sentence, papers) for _, sentence, _, papers, _ in batch])
+            failure = None
+        except Exception as exc:
+            _logger.warning("judgement failed: %s", exc)
+            judgements, failure = {}, _llm_error(exc)
+        for n, (i, sentence, query, papers, search_status) in enumerate(batch, 1):
+            j = judgements.get(n)
+            if j is None:
+                reason = f"근거 판단에 실패했습니다 ({failure or '모델 응답에 이 문장이 빠짐'}). 후보 논문을 직접 확인하세요."
+                results[i] = _result(sentence, query, papers, "error", reason, search_status)
+            else:
+                results[i] = _result(
+                    sentence, query, papers, j.verdict, j.reason, search_status,
+                    supporting=set(j.supporting), contradicting=set(j.contradicting),
+                )
+    return results
 
 
 def analyze_draft(text: str) -> tuple[list[dict], bool]:
@@ -221,13 +278,11 @@ def analyze_draft(text: str) -> tuple[list[dict], bool]:
     sentences = split_sentences(text)
     truncated = len(sentences) > _MAX_SENTENCES
     sentences = sentences[:_MAX_SENTENCES]
+    if not sentences:
+        return [], truncated
 
     client = _get_client()
     if client is None:
-        worker = _analyze_heuristic
-    else:
-        def worker(sentence):
-            return _analyze_agentic(client, sentence)
-
-    with ThreadPoolExecutor(max_workers=_SENTENCE_WORKERS) as pool:
-        return list(pool.map(worker, sentences)), truncated
+        with ThreadPoolExecutor(max_workers=_SEARCH_WORKERS) as pool:
+            return list(pool.map(_analyze_heuristic, sentences)), truncated
+    return _analyze_agentic(client, sentences), truncated
