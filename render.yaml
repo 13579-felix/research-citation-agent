@@ -6,10 +6,10 @@ services:
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --app-dir backend
     envVars:
-      - key: ANTHROPIC_API_KEY
+      - key: GEMINI_API_KEY
         sync: false
-      - key: ANTHROPIC_MODEL
-        value: claude-sonnet-5
+      - key: GEMINI_MODEL
+        value: gemini-flash-latest
       - key: OPENALEX_MAILTO
         sync: false
       - key: OPENALEX_API_KEY

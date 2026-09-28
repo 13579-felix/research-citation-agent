@@ -7,15 +7,18 @@ AI+X 1차 과제 프로젝트: **연구 글쓰기용 선행연구 인용 자동 
 API에서 관련 선행연구를 검색해 근거를 매칭합니다 (모두 키 없이 사용 가능,
 `SEMANTIC_SCHOLAR_API_KEY`를 설정하면 Semantic Scholar도 추가).
 
-- **Agentic 모드** (`ANTHROPIC_API_KEY` 설정): Claude가 ① 인용이 필요한 문장인지 판별하고,
+- **Agentic 모드** (`GEMINI_API_KEY` 설정, [Google AI Studio](https://aistudio.google.com/apikey)에서 무료 발급): Gemini가 ① 인용이 필요한 문장인지 판별하고,
   ② 영어 검색어를 만들고, ③ 후보 논문 초록 전문과 대조해 **근거 확인 / 근거와 모순 / 근거 부족**을
   판정합니다. 수치·조건이 다르면 모순으로 봅니다.
 - **휴리스틱 모드** (키 없음): 문장에서 구체적인 영문 전문용어(FeFET, HZO, TiN 등; "Si"·"nm" 같은
   일반 조각은 제외)만 뽑아 후보 논문을 검색하고, 근거 여부는 판단하지 않아 **미판정**으로 표시합니다.
 
 판정 결과는 `근거 확인`, `근거와 모순`, `근거 부족`, `인용 불필요`, `미판정`, `판단 실패` 중 하나입니다.
-판단을 하지 않았거나 판단에 실패한 문장은 절대 "근거 확인"으로 표시하지 않습니다. 카드 하단에는
+판단을 하지 않았거나 판단에 실패한 문장은 절대 "근거 확인"으로 표시하지 않습니다. AI 판정은 보조 수단이므로 인용 전 표시된 논문을 직접 확인하세요. 카드 하단에는
 검색 소스별 성공/실패가 표시되어, 특정 소스(예: OpenAlex)가 조용히 실패하는 경우를 바로 알 수 있습니다.
+
+무료 등급 참고: Gemini 무료 등급은 분당 요청 수 제한이 있어 문장이 많으면 느려질 수 있고(자동 재시도),
+Google 약관상 무료 등급 입력은 서비스 개선에 사용될 수 있으니 미발표 연구 내용 입력 시 유의하세요.
 
 ## 배경
 
@@ -35,7 +38,7 @@ pip install -r requirements.txt
 ```
 
 Agentic 모드를 쓰려면 프로젝트 루트에 `.env` 파일을 만들고 (`.env.example` 참고)
-본인의 `ANTHROPIC_API_KEY`를 넣습니다. 없어도 휴리스틱 모드로 바로 동작합니다.
+본인의 `GEMINI_API_KEY`를 넣습니다. 없어도 휴리스틱 모드로 바로 동작합니다.
 
 ```bash
 uvicorn app:app --reload --port 8000
@@ -48,7 +51,7 @@ uvicorn app:app --reload --port 8000
 ```
 backend/
   app.py               FastAPI 엔트리포인트, /api/analyze
-  agent.py             인용 필요 판별 → 검색 → 근거/모순 판정 (Claude 또는 휴리스틱)
+  agent.py             인용 필요 판별 → 검색 → 근거/모순 판정 (Gemini 또는 휴리스틱)
   claim_extractor.py   초안 텍스트를 문장 단위 주장으로 분리
   citation_search.py   OpenAlex + Crossref + arXiv (+ Semantic Scholar) 병렬 검색
 frontend/
