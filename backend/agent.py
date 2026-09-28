@@ -67,11 +67,22 @@ class CitationPlans(BaseModel):
     plans: list[CitationPlan]
 
 
+class Evidence(BaseModel):
+    paper: int = Field(description="Paper number within this claim")
+    quote: str = Field(description="Verbatim span copied from that paper's abstract or title (or just the publication year, e.g. 2011)")
+    stance: Literal["supports", "contradicts"]
+    special_condition: str = Field(
+        description="한국어. 이 결과가 특수 처리·조건에서만 얻은 값이면 그 조건(예: '칼슘 캡핑 후'), 일반적인 값이면 빈 문자열"
+    )
+
+
 class ConditionCheck(BaseModel):
-    condition: str = Field(description="한국어. 주장을 이루는 구체적 조건 하나 (예: 'HZO 두께 5 nm', '2Pr이 10 nm 시료와 같은 수준')")
-    status: Literal["confirmed", "contradicted", "not_mentioned"]
-    paper: int = Field(description="Paper number within this claim whose abstract confirms/contradicts it; 0 if not_mentioned")
-    quote: str = Field(description="Verbatim span copied from that paper's abstract (English, unchanged). Empty if not_mentioned.")
+    condition: str = Field(description="한국어. 주장을 이루는 조건 하나")
+    kind: Literal["subject", "fact", "qualifier"] = Field(
+        description="subject: 주제·대상 이름만(예: 'a-IGZO'); fact: 구체적 사실·수치·공정 조건; "
+        "qualifier: 일반성·최초·비교 표현(typically, generally, first, higher than LTPS 등)"
+    )
+    evidence: list[Evidence] = Field(description="All supporting AND contradicting evidence from every paper; empty if none")
 
 
 class PaperMatch(BaseModel):
@@ -82,6 +93,10 @@ class PaperMatch(BaseModel):
 class Judgement(BaseModel):
     index: int = Field(description="The claim number given in the input")
     conditions: list[ConditionCheck]
+    overall: Literal["supported", "contradicted", "insufficient"] = Field(
+        description="문장 전체(한정어·비교 포함)가 초록들로 성립하는지에 대한 종합 판정"
+    )
+    overall_reason: str = Field(description="한국어 1~2문장. 종합 판정 이유")
     matches: list[PaperMatch] = Field(default_factory=list)
 
 
@@ -180,21 +195,23 @@ def _judge_with_llm(client, claims: list[tuple[str, list[dict]]]) -> dict[int, J
         "논문의 초록과 대조하라. 주장마다 번호(index)를 그대로 쓰고, 논문 번호는 그 주장 안에서의 "
         "번호를 쓴다.\n\n"
         "절차:\n"
-        "1) 주장을 검증 가능한 구체적 조건으로 모두 나눠라: 대상 재료·소자, 두께 등 치수, 수치, "
-        "비교 대상('~와 같은 수준', '~보다 높다'), 공정 조건(온도·방법), 연도·최초 여부 등. "
-        "비교 표현은 그 비교 자체를 하나의 조건으로 둔다.\n"
-        "2) 각 조건마다 초록에 그 조건이 명시돼 있으면 confirmed, 초록이 반대 결과(다른 수치, 반대 "
-        "경향, 다른 조건에서만 성립)를 보고하면 contradicted, 명시돼 있지 않으면 not_mentioned.\n"
-        "3) confirmed/contradicted에는 해당 초록에서 그대로 복사한 문구(quote)를 반드시 넣어라. "
-        "문구를 바꾸거나 요약하거나 번역하지 마라. 복사할 문구가 없으면 not_mentioned다.\n"
-        "추론·배경지식·키워드 겹침으로 confirmed 처리하지 마라. 초록에 직접 쓰여 있는 것만 인정한다. "
-        "인용 문구는 주장과 같은 재료·소자에 대한 내용이어야 한다(예: IGZO 주장에 a-Si 논문 문구 불가).\n"
-        "수치 주장(예: '100 cm²/Vs를 넘는다', '5 nm에서도 같다')은 같은 재료·물성에 대해 초록이 그 범위 "
-        "밖의 값(예: 10~50 cm²/Vs)이나 반대 경향을 보고하면 contradicted로 하고, 그 수치 문구를 quote로 넣어라.\n"
-        "단, 제목과 출판 연도도 근거로 쓸 수 있다: 제목에서 확인되면 제목 일부를 그대로 quote로, 연도 "
-        "조건(예: 2011년 보고)은 그 논문의 출판 연도가 맞을 때 quote에 연도 숫자만(예: 2011) 넣어라. "
-        "'최초' 같은 주장은 초록·제목에 first 등으로 명시된 경우에만 confirmed.\n"
-        "4) matches: 후보 논문마다, 그 초록에서 주장과 가장 관련 깊은 문장 하나를 한 문장 전체 그대로 "
+        "1) 주장을 조건으로 나누고 종류를 붙여라. subject: 주제·대상 이름만(예: 'a-IGZO'). fact: 구체적 "
+        "사실·수치·공정 조건(두께, 온도, 이동도 값, 연도 등). qualifier: 일반성·최초·비교 표현"
+        "('typically', 'generally', 'first', 'higher than LTPS', '~와 같은 수준'). 한정어와 비교는 반드시 "
+        "별도 qualifier 조건으로 둔다.\n"
+        "2) 각 조건마다 모든 후보 논문에서 지지 근거와 반대 근거를 **둘 다** 찾아 evidence에 넣어라. "
+        "반대 근거를 빠뜨리지 마라:\n"
+        "   - 같은 재료·물성에 대해 주장 범위 밖의 값(예: 주장 '>100 cm²/Vs'인데 초록 '18.1 cm²/Vs')은 contradicts.\n"
+        "   - 같은 문장 안의 기준값·처리 전 값·비교군 값도 따로 평가하라(예: '12에서 160으로 증가'라면 "
+        "'12'는 일반 a-IGZO 값으로 contradicts, '160'은 special_condition='칼슘 캡핑 후'인 supports).\n"
+        "   - 특수 처리·특수 조건에서만 얻은 결과는 special_condition에 그 조건을 적어라.\n"
+        "3) quote는 해당 초록(또는 제목)에서 그대로 복사하라. 바꾸거나 요약·번역하지 마라. 연도 근거는 "
+        "그 논문의 출판 연도 숫자만(예: 2011). quote는 주장과 같은 재료·소자에 대한 내용이어야 한다.\n"
+        "4) qualifier는 초록이 그 일반성·비교를 직접 말할 때만 supports다(예: 'typically', 'higher than', "
+        "'first'). 예외적·특수 조건의 결과 하나로 '일반적으로'나 '최초'를 지지할 수 없다.\n"
+        "5) overall: 한정어·비교를 포함한 문장 전체가 초록들로 성립하면 supported, 반대 근거가 있으면 "
+        "contradicted, 판단할 근거가 부족하면 insufficient. 확신이 없으면 supported로 하지 마라.\n"
+        "6) matches: 후보 논문마다, 그 초록에서 주장과 가장 관련 깊은 문장 하나를 한 문장 전체 그대로 "
         "복사하라(바꾸거나 줄이지 말 것). 초록이 없으면 빈 문자열.\n\n"
         + "\n\n".join(blocks),
     )
@@ -245,81 +262,159 @@ def _matched_sentence(paper: dict, claim: str, query: str, llm_sentence: str = "
 
 
 _STATUS_LABEL = {
-    "other_paper": "다른 논문에서만 확인","confirmed": "확인", "contradicted": "모순", "not_mentioned": "확인 안 됨"}
+    "confirmed": "확인",
+    "contradicted": "모순",
+    "not_mentioned": "확인 안 됨",
+    "other_paper": "다른 논문에서만 확인",
+    "subject": "주제어 (판정 제외)",
+}
 
 
-def _verdict_from(judgement: Judgement, papers: list[dict]):
-    """Decide the verdict in code from quote-verified conditions.
+# A qualifier ("typically", "first", "higher than LTPS") is only supported by a
+# quote that itself states generality, priority or a comparison.
+_QUALIFIER_MARKERS = re.compile(
+    r"\b(typical\w*|general\w*|usual\w*|common\w*|widely|most|first|pioneer\w*|"
+    r"higher|lower|greater|larger|smaller|superior|inferior|better|worse|exceed\w*|outperform\w*|"
+    r"than|compared|comparable|similar|same|equal\w*|over|above|below)\b"
+)
 
-    - Every confirmed/contradicted condition must carry a quote that really
-      occurs in that paper's abstract or title (or equals its publication
-      year); otherwise it is downgraded to "not mentioned".
-    - Support must come from ONE paper: conditions confirmed only by other
-      papers don't count (no stitching "flexible substrate" from one paper
-      and "2004" from another).
-    - A year match alone never counts as support.
+
+def _verify_quote(ev: Evidence, papers: list[dict]) -> tuple[bool, bool]:
+    """(quote really occurs in that paper's abstract/title or is its year, is_year)."""
+    paper = papers[ev.paper - 1] if 1 <= ev.paper <= len(papers) else {}
+    quote = _normalize(ev.quote)
+    is_year = quote.isdigit() and len(quote) == 4 and quote == str(paper.get("year"))
+    in_text = len(quote) >= 8 and (
+        quote in _normalize(paper.get("abstract") or "") or quote in _normalize(paper.get("title") or "")
+    )
+    return is_year or in_text, is_year
+
+
+# Generality/priority words in the claim itself. If one is present, the
+# claim cannot be (partially) supported unless a qualifier was confirmed.
+_CLAIM_QUALIFIERS = re.compile(
+    r"\b(typically|generally|usually|commonly|always|widely|first|in general)\b|일반적|대부분|항상|최초|처음",
+    re.IGNORECASE,
+)
+
+
+def _verdict_from(judgement: Judgement, papers: list[dict], sentence: str = ""):
+    """Decide the verdict in code from quote-verified evidence.
+
+    Rules (each exists because a real run got it wrong):
+    - Every quote must really occur in that paper's abstract/title (or be its
+      publication year), otherwise the evidence is dropped.
+    - Contradicting evidence is looked for, not just support; one verified
+      contradiction makes the claim "contradicted".
+    - "subject" conditions (just naming the material) never count.
+    - A qualifier (typically/first/higher than) is only supported by
+      evidence with no special condition whose quote states generality or a
+      comparison; a Ca-capped 160 cm²/Vs cannot support "typically >100".
+    - Support must come from one paper, and a year match alone never counts.
+    - The model's whole-sentence verdict can only make the result more
+      cautious, never upgrade it.
     """
-    verified = []  # (condition, status, paper, quote, is_year)
+    checks = []
     for c in judgement.conditions:
-        status, is_year = c.status, False
-        if status != "not_mentioned":
-            paper = papers[c.paper - 1] if 1 <= c.paper <= len(papers) else {}
-            quote = _normalize(c.quote)
-            is_year = quote.isdigit() and len(quote) == 4 and quote == str(paper.get("year"))
-            in_text = len(quote) >= 8 and (
-                quote in _normalize(paper.get("abstract") or "") or quote in _normalize(paper.get("title") or "")
-            )
-            if not (is_year or in_text):
-                status = "not_mentioned"
-        verified.append((c, status, is_year))
+        supports, contradicts, notes = [], [], []
+        for ev in c.evidence:
+            ok, is_year = _verify_quote(ev, papers)
+            if not ok:
+                continue
+            if ev.stance == "contradicts":
+                contradicts.append(ev)
+                continue
+            if c.kind == "qualifier" and ev.special_condition.strip():
+                notes.append(f"논문 ({ev.paper})의 값은 '{ev.special_condition.strip()}' 조건의 결과라 일반화 근거가 아님")
+                continue
+            if c.kind == "qualifier" and not _QUALIFIER_MARKERS.search(ev.quote.lower()):
+                notes.append(f"논문 ({ev.paper}) 인용문에 일반성·비교 표현이 없음")
+                continue
+            supports.append((ev, is_year))
+        checks.append({"c": c, "supports": supports, "contradicts": contradicts, "notes": notes})
 
-    # The paper that confirms the most conditions (by text, not just year).
+    # The single paper confirming the most non-subject conditions by text.
     text_hits: dict[int, int] = {}
-    for c, status, is_year in verified:
-        if status == "confirmed" and not is_year:
-            text_hits[c.paper] = text_hits.get(c.paper, 0) + 1
+    for ch in checks:
+        if ch["c"].kind == "subject":
+            continue
+        for p in {ev.paper for ev, is_year in ch["supports"] if not is_year}:
+            text_hits[p] = text_hits.get(p, 0) + 1
     best = max(text_hits, key=text_hits.get) if text_hits else None
 
-    checks, supporting, contradicting = [], set(), set()
-    for c, status, is_year in verified:
-        if status == "confirmed" and c.paper != best:
-            status = "other_paper"
-        if status == "confirmed":
-            supporting.add(c.paper)
-        elif status == "contradicted":
-            contradicting.add(c.paper)
-        shown = status in ("confirmed", "contradicted", "other_paper")
-        checks.append({
+    rendered, supporting, contradicting = [], set(), set()
+    for ch in checks:
+        c = ch["c"]
+        best_support = [ev for ev, _ in ch["supports"] if ev.paper == best]
+        if ch["contradicts"] and c.kind != "subject":
+            status, shown = "contradicted", ch["contradicts"]
+            contradicting |= {ev.paper for ev in shown}
+        elif best_support:
+            status, shown = "confirmed", best_support
+            supporting |= {ev.paper for ev in shown}
+        elif ch["supports"]:
+            status, shown = "other_paper", [ev for ev, _ in ch["supports"]]
+        else:
+            status, shown = "not_mentioned", []
+        if c.kind == "subject" and status != "confirmed":
+            status = "subject"
+        rendered.append({
             "condition": c.condition,
+            "kind": c.kind,
             "status": status,
             "label": _STATUS_LABEL[status],
-            "paper": c.paper if shown else None,
-            "quote": c.quote if shown else "",
+            "evidence": [
+                {"paper": ev.paper, "quote": ev.quote, "stance": ev.stance, "special_condition": ev.special_condition}
+                for ev in shown
+            ],
+            "notes": ch["notes"],
         })
 
-    def names(*statuses):
-        return ", ".join(ch["condition"] for ch in checks if ch["status"] in statuses)
+    counted = [r for r in rendered if r["kind"] != "subject"]
 
-    if contradicting:
+    def names(*statuses):
+        return ", ".join(r["condition"] for r in counted if r["status"] in statuses)
+
+    if any(r["status"] == "contradicted" for r in counted):
         verdict = "contradicted"
-        reason = f"초록과 상충하는 조건이 있습니다: {names('contradicted')}."
-    elif checks and best is not None and all(ch["status"] == "confirmed" for ch in checks):
+        reason = f"초록에 주장과 반대되는 근거가 있습니다: {names('contradicted')}."
+    elif counted and best is not None and all(r["status"] == "confirmed" for r in counted):
         verdict = "supported"
-        reason = f"주장의 모든 조건이 논문 ({best})의 초록·서지 정보에서 원문 인용으로 확인되었습니다."
+        reason = f"주장의 모든 조건(한정어 포함)이 논문 ({best})에서 원문 인용으로 확인되었습니다."
     elif best is not None:
         verdict = "partial"
         reason = (
-            f"논문 ({best})에서 일부 조건만 원문으로 확인되었습니다. 확인됨: {names('confirmed')}. "
-            f"확인 안 됨: {names('not_mentioned', 'other_paper')}. 확인 안 된 부분의 근거를 보완하거나 표현을 조정하세요."
+            f"논문 ({best})에서 일부 조건만 확인되었습니다. 확인됨: {names('confirmed')}. "
+            f"확인 안 됨: {names('not_mentioned', 'other_paper')}."
         )
     elif not any(p.get("abstract") for p in papers):
         verdict = "unverifiable"
         reason = "후보 논문에 초록이 없어 내용을 확인할 수 없습니다. 논문을 직접 열어 확인하세요."
     else:
         verdict = "insufficient"
-        missing = names("not_mentioned", "other_paper") or "주장의 구체적 조건"
-        reason = f"초록에서 확인되지 않은 조건이 있습니다: {missing}. 이 부분의 근거를 보완하거나 표현을 수정하세요."
-    return verdict, reason, checks, supporting, contradicting
+        reason = f"초록에서 확인되지 않은 조건이 있습니다: {names('not_mentioned', 'other_paper') or '주장의 구체적 조건'}."
+
+    qualifier_confirmed = any(r["kind"] == "qualifier" and r["status"] == "confirmed" for r in rendered)
+    if verdict in ("supported", "partial") and _CLAIM_QUALIFIERS.search(sentence) and not qualifier_confirmed:
+        verdict = "insufficient"
+        reason = (
+            f"문장의 한정어('{_CLAIM_QUALIFIERS.search(sentence).group(0)}')를 뒷받침하는 일반적 근거가 초록에 없습니다. "
+            f"개별 사례의 확인({names('confirmed') or '없음'})만으로는 이 표현을 지지할 수 없습니다."
+        )
+
+    # The whole-sentence judgement can only make things more cautious.
+    overall = judgement.overall
+    if verdict in ("supported", "partial") and overall == "contradicted":
+        verdict = "insufficient"
+        reason += f" 문장 전체로는 반대 근거가 있다고 판단되었으나 원문 인용으로 검증되지 않았습니다: {judgement.overall_reason}"
+    elif verdict == "supported" and overall == "insufficient":
+        verdict = "partial"
+        reason += f" 다만 문장 전체로는 근거가 충분하지 않다고 판단되었습니다: {judgement.overall_reason}"
+    elif verdict == "partial":
+        reason += " 확인 안 된 부분의 근거를 보완하거나 표현을 조정하세요."
+    if verdict == "insufficient" and overall != "contradicted":
+        reason += " 이 부분의 근거를 보완하거나 표현을 수정하세요."
+    return verdict, reason, rendered, supporting, contradicting
 
 
 def _result(sentence, query, papers, status, reason, search_status=None, supporting=(), contradicting=(),
@@ -444,7 +539,7 @@ def _analyze_agentic(client, sentences: list[str]) -> list[dict]:
                 reason = f"근거 판단에 실패했습니다 ({failure or '모델 응답에 이 문장이 빠짐'}). 후보 논문을 직접 확인하세요."
                 results[i] = _result(sentence, query, papers, "error", reason, search_status)
             else:
-                verdict, reason, checks, supporting, contradicting = _verdict_from(j, papers)
+                verdict, reason, checks, supporting, contradicting = _verdict_from(j, papers, sentence)
                 results[i] = _result(
                     sentence, query, papers, verdict, reason, search_status,
                     supporting=supporting, contradicting=contradicting, conditions=checks,
