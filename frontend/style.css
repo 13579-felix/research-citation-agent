@@ -144,3 +144,10 @@ button:disabled { opacity: 0.6; cursor: default; }
 .cond.not_mentioned .cond-label { color: var(--caution); }
 .cond-quote { color: var(--muted); font-style: italic; margin: 2px 0 0 68px; }
 .paper-num { color: var(--muted); font-size: 0.72rem; margin-right: 4px; }
+
+.matched {
+  margin: 6px 0 0; padding: 6px 10px; border-left: 2px solid var(--border);
+  font-size: 0.8rem; line-height: 1.5; color: var(--text); background: var(--surface); border-radius: 0 6px 6px 0;
+}
+.matched.none { color: var(--muted); font-size: 0.75rem; border-left: none; background: none; padding: 4px 0 0; }
+.matched-source { display: block; color: var(--muted); font-size: 0.7rem; margin-top: 2px; }
