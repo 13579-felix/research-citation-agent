@@ -3,11 +3,19 @@
 AI+X 1차 과제 프로젝트: **연구 글쓰기용 선행연구 인용 자동 매칭 및 근거 보완 Agentic AI**
 
 연구 배경 문단이나 논문/연구계획서 초안을 입력하면 문장 단위로 주장을 추출하고,
-[OpenAlex](https://openalex.org/)와 [arXiv](https://arxiv.org/) API에서 관련 선행연구를 검색해
-근거를 매칭합니다 (둘 다 API 키 없이 무료로 사용 가능). `ANTHROPIC_API_KEY`를 설정하면 Claude가 검색어 생성과
-"근거가 충분한지" 판단까지 수행하는 Agentic 모드로 동작하고, 키가 없으면
-영문 전문용어 추출 기반 휴리스틱으로 동작합니다 (예: FeFET, HZO, TiN capping 같은
-재료·소자 연구의 영문 전문용어를 문장에서 뽑아 검색어로 사용).
+[OpenAlex](https://openalex.org/), [Crossref](https://www.crossref.org/), [arXiv](https://arxiv.org/)
+API에서 관련 선행연구를 검색해 근거를 매칭합니다 (모두 키 없이 사용 가능,
+`SEMANTIC_SCHOLAR_API_KEY`를 설정하면 Semantic Scholar도 추가).
+
+- **Agentic 모드** (`ANTHROPIC_API_KEY` 설정): Claude가 ① 인용이 필요한 문장인지 판별하고,
+  ② 영어 검색어를 만들고, ③ 후보 논문 초록 전문과 대조해 **근거 확인 / 근거와 모순 / 근거 부족**을
+  판정합니다. 수치·조건이 다르면 모순으로 봅니다.
+- **휴리스틱 모드** (키 없음): 문장에서 구체적인 영문 전문용어(FeFET, HZO, TiN 등; "Si"·"nm" 같은
+  일반 조각은 제외)만 뽑아 후보 논문을 검색하고, 근거 여부는 판단하지 않아 **미판정**으로 표시합니다.
+
+판정 결과는 `근거 확인`, `근거와 모순`, `근거 부족`, `인용 불필요`, `미판정`, `판단 실패` 중 하나입니다.
+판단을 하지 않았거나 판단에 실패한 문장은 절대 "근거 확인"으로 표시하지 않습니다. 카드 하단에는
+검색 소스별 성공/실패가 표시되어, 특정 소스(예: OpenAlex)가 조용히 실패하는 경우를 바로 알 수 있습니다.
 
 ## 배경
 
@@ -21,7 +29,8 @@ SUT(Simultaneous UV-Thermal) 처리 등 선행연구를 지속적으로 조사�
 ```bash
 cd backend
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate       # macOS / Linux
 pip install -r requirements.txt
 ```
 
@@ -39,9 +48,9 @@ uvicorn app:app --reload --port 8000
 ```
 backend/
   app.py               FastAPI 엔트리포인트, /api/analyze
-  agent.py             문장별 검색어 생성 + 근거 충분성 판단 (Claude 또는 휴리스틱)
+  agent.py             인용 필요 판별 → 검색 → 근거/모순 판정 (Claude 또는 휴리스틱)
   claim_extractor.py   초안 텍스트를 문장 단위 주장으로 분리
-  citation_search.py   OpenAlex + arXiv API 래퍼
+  citation_search.py   OpenAlex + Crossref + arXiv (+ Semantic Scholar) 병렬 검색
 frontend/
   index.html, app.js, style.css   단순 정적 웹 UI
 ```
