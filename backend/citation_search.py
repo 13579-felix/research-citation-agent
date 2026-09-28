@@ -30,12 +30,20 @@ def _user_agent() -> str:
     return f"research-citation-agent/1.0 (mailto:{email})" if email else "research-citation-agent/1.0"
 
 
-def _get(url: str, provider: str, **kwargs) -> requests.Response:
+def _get(url: str, provider: str, retries: int = 2, **kwargs) -> requests.Response:
+    """GET with a short back-off on 429: OpenAlex rate-limits the shared
+    outbound IPs of hosts like Render, and several sentences are searched
+    at once."""
     headers = {"User-Agent": _user_agent(), **kwargs.pop("headers", {})}
-    try:
-        resp = requests.get(url, headers=headers, timeout=_TIMEOUT, **kwargs)
-    except requests.RequestException as exc:
-        raise SearchError(f"{provider} 요청 실패: {exc.__class__.__name__}") from exc
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=_TIMEOUT, **kwargs)
+        except requests.RequestException as exc:
+            raise SearchError(f"{provider} 요청 실패: {exc.__class__.__name__}") from exc
+        if resp.status_code != 429 or attempt == retries:
+            break
+        retry_after = resp.headers.get("Retry-After", "")
+        time.sleep(min(float(retry_after), 5.0) if retry_after.isdigit() else 1.5 * (attempt + 1))
     if resp.status_code != 200:
         raise SearchError(f"{provider} HTTP {resp.status_code}: {resp.text[:120]}")
     return resp
@@ -151,14 +159,7 @@ def search_semantic_scholar(query: str, limit: int) -> list[dict]:
     pool returns 429 too often to be useful (see git history)."""
     headers = {"x-api-key": os.environ["SEMANTIC_SCHOLAR_API_KEY"]}
     params = {"query": query, "limit": limit, "fields": _S2_FIELDS}
-    for attempt in range(3):
-        try:
-            resp = _get(_S2_API, "Semantic Scholar", params=params, headers=headers)
-            break
-        except SearchError as exc:
-            if "HTTP 429" not in str(exc) or attempt == 2:
-                raise
-            time.sleep(2 * (attempt + 1))
+    resp = _get(_S2_API, "Semantic Scholar", params=params, headers=headers)
 
     papers = []
     for p in resp.json().get("data", []):
