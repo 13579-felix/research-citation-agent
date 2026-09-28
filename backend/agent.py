@@ -65,9 +65,15 @@ class ConditionCheck(BaseModel):
     quote: str = Field(description="Verbatim span copied from that paper's abstract (English, unchanged). Empty if not_mentioned.")
 
 
+class PaperMatch(BaseModel):
+    paper: int = Field(description="Paper number within this claim")
+    sentence: str = Field(description="The one abstract sentence most relevant to the claim, copied verbatim and whole. Empty if no abstract.")
+
+
 class Judgement(BaseModel):
     index: int = Field(description="The claim number given in the input")
     conditions: list[ConditionCheck]
+    matches: list[PaperMatch] = Field(default_factory=list)
 
 
 class Judgements(BaseModel):
@@ -169,7 +175,9 @@ def _judge_with_llm(client, claims: list[tuple[str, list[dict]]]) -> dict[int, J
         "경향, 다른 조건에서만 성립)를 보고하면 contradicted, 명시돼 있지 않으면 not_mentioned.\n"
         "3) confirmed/contradicted에는 해당 초록에서 그대로 복사한 문구(quote)를 반드시 넣어라. "
         "문구를 바꾸거나 요약하거나 번역하지 마라. 복사할 문구가 없으면 not_mentioned다.\n"
-        "추론·배경지식·키워드 겹침으로 confirmed 처리하지 마라. 초록에 직접 쓰여 있는 것만 인정한다.\n\n"
+        "추론·배경지식·키워드 겹침으로 confirmed 처리하지 마라. 초록에 직접 쓰여 있는 것만 인정한다.\n"
+        "4) matches: 후보 논문마다, 그 초록에서 주장과 가장 관련 깊은 문장 하나를 한 문장 전체 그대로 "
+        "복사하라(바꾸거나 줄이지 말 것). 초록이 없으면 빈 문자열.\n\n"
         + "\n\n".join(blocks),
     )
     return {j.index: j for j in result.judgements}
@@ -180,6 +188,42 @@ _NON_WORD = re.compile(r"[\W_]+")
 
 def _normalize(text: str) -> str:
     return _NON_WORD.sub(" ", unicodedata.normalize("NFKC", text).lower()).strip()
+
+
+_ABSTRACT_SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9(])")
+_MATCH_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "are", "was", "were", "has", "have",
+    "been", "its", "their", "which", "than", "can", "also", "such", "into", "our", "these",
+    "study", "paper", "work", "results", "show", "shows", "using", "based",
+    "of", "as", "to", "in", "on", "by", "at", "is", "be", "an", "or", "it", "we",
+}
+
+
+def _terms(text: str) -> set[str]:
+    return {t for t in _normalize(text).split() if len(t) >= 2 and t not in _MATCH_STOPWORDS}
+
+
+def _keyword_best_sentence(abstract: str, claim: str, query: str) -> str:
+    """Abstract sentence sharing the most terms with the claim/query; "" if none overlap."""
+    wanted = _terms(claim) | _terms(query)
+    best, best_score = "", 0
+    for sent in _ABSTRACT_SENTENCE.split(abstract.strip()):
+        score = len(_terms(sent) & wanted)
+        if score > best_score:
+            best, best_score = sent.strip(), score
+    return best
+
+
+def _matched_sentence(paper: dict, claim: str, query: str, llm_sentence: str = "") -> tuple[str, str]:
+    """(sentence, source): the Gemini-picked sentence if it really is in the
+    abstract, else a keyword-overlap pick, else nothing."""
+    abstract = paper.get("abstract") or ""
+    if not abstract:
+        return "", ""
+    if llm_sentence and len(_normalize(llm_sentence)) >= 8 and _normalize(llm_sentence) in _normalize(abstract):
+        return llm_sentence.strip(), "gemini"
+    sentence = _keyword_best_sentence(abstract, claim, query)
+    return (sentence, "keyword") if sentence else ("", "")
 
 
 _STATUS_LABEL = {"confirmed": "확인", "contradicted": "모순", "not_mentioned": "확인 안 됨"}
@@ -229,17 +273,22 @@ def _verdict_from(judgement: Judgement, papers: list[dict]):
     return verdict, reason, checks, supporting, contradicting
 
 
-def _result(sentence, query, papers, status, reason, search_status=None, supporting=(), contradicting=(), conditions=()):
+def _result(sentence, query, papers, status, reason, search_status=None, supporting=(), contradicting=(),
+            conditions=(), llm_matches=None):
+    llm_matches = llm_matches or {}
+    rendered = []
+    for i, p in enumerate(papers, 1):
+        matched, source = _matched_sentence(p, sentence, query, llm_matches.get(i, ""))
+        rendered.append({
+            **{k: v for k, v in p.items() if k != "abstract"},
+            "role": "contradicting" if i in contradicting else "supporting" if i in supporting else None,
+            "matched_sentence": matched,
+            "match_source": source,
+        })
     return {
         "sentence": sentence,
         "query": query,
-        "papers": [
-            {
-                **{k: v for k, v in p.items() if k != "abstract"},
-                "role": "contradicting" if i in contradicting else "supporting" if i in supporting else None,
-            }
-            for i, p in enumerate(papers, 1)
-        ],
+        "papers": rendered,
         "status": status,
         "reason": reason,
         "search_status": search_status or {},
@@ -345,6 +394,7 @@ def _analyze_agentic(client, sentences: list[str]) -> list[dict]:
                 results[i] = _result(
                     sentence, query, papers, verdict, reason, search_status,
                     supporting=supporting, contradicting=contradicting, conditions=checks,
+                    llm_matches={m.paper: m.sentence for m in j.matches},
                 )
     return results
 

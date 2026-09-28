@@ -35,6 +35,18 @@ async function loadStatus() {
   }
 }
 
+function matchedHTML(p) {
+  if (!p.matched_sentence) {
+    return `<div class="matched none">초록이 없어 매칭 문장을 찾을 수 없습니다.</div>`;
+  }
+  const source = p.match_source === "gemini" ? "Gemini 선택 · 원문 확인됨" : "키워드 일치 (자동)";
+  return `
+    <blockquote class="matched">
+      “${esc(p.matched_sentence)}”
+      <span class="matched-source">초록 원문 · ${source}</span>
+    </blockquote>`;
+}
+
 function paperHTML(p, i) {
   const authors = p.authors.slice(0, 3).join(", ") + (p.authors.length > 3 ? " 외" : "");
   const role = p.role === "supporting" ? "근거" : p.role === "contradicting" ? "모순" : "";
@@ -44,6 +56,7 @@ function paperHTML(p, i) {
       ${role ? `<span class="paper-role">${role}</span>` : ""}
       <a href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">${esc(p.title)}</a>
       <div class="paper-meta">${esc(authors)} · ${esc(p.year ?? "연도 미상")} ${p.venue ? "· " + esc(p.venue) : ""} · ${esc(p.provider)}</div>
+      ${matchedHTML(p)}
     </div>`;
 }
 
