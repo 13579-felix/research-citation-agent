@@ -77,11 +77,19 @@ function searchStatusHTML(status) {
 
 function conditionsHTML(conditions) {
   if (!conditions || !conditions.length) return "";
-  const rows = conditions.map((c) => `
-    <li class="cond ${esc(c.status)}">
-      <span class="cond-label">${esc(c.label)}</span> ${esc(c.condition)}
-      ${c.quote ? `<div class="cond-quote">“${esc(c.quote)}” — 논문 (${esc(c.paper)})</div>` : ""}
-    </li>`).join("");
+  const rows = conditions.map((c) => {
+    const evidence = (c.evidence || []).map((e) => `
+      <div class="cond-quote ${e.stance}">
+        ${e.stance === "contradicts" ? "반대" : "지지"} · 논문 (${esc(e.paper)}): “${esc(e.quote)}”
+        ${e.special_condition ? `<span class="cond-special">[${esc(e.special_condition)}]</span>` : ""}
+      </div>`).join("");
+    const notes = (c.notes || []).map((n) => `<div class="cond-note">※ ${esc(n)}</div>`).join("");
+    return `
+      <li class="cond ${esc(c.status)}">
+        <span class="cond-label">${esc(c.label)}</span> ${esc(c.condition)}
+        ${evidence}${notes}
+      </li>`;
+  }).join("");
   return `<ul class="conditions">${rows}</ul>`;
 }
 
