@@ -92,11 +92,20 @@ def search_openalex(query: str, limit: int, year: int | None = None) -> list[dic
     return papers
 
 
+def _crossref_year(item: dict) -> int | None:
+    # "issued" is often [[null]] for older records; fall back to other dates.
+    for field in ("issued", "published-print", "published-online", "created"):
+        parts = (item.get(field) or {}).get("date-parts") or []
+        if parts and parts[0] and parts[0][0]:
+            return int(parts[0][0])
+    return None
+
+
 def search_crossref(query: str, limit: int, year: int | None = None) -> list[dict]:
     params = {
         "query.bibliographic": query,
         "rows": limit,
-        "select": "DOI,title,author,issued,container-title,abstract,URL",
+        "select": "DOI,title,author,issued,published-print,published-online,created,container-title,abstract,URL",
     }
     if year:
         params["filter"] = f"from-pub-date:{year - 1},until-pub-date:{year + 1}"
@@ -106,7 +115,6 @@ def search_crossref(query: str, limit: int, year: int | None = None) -> list[dic
 
     papers = []
     for item in resp.json().get("message", {}).get("items", []):
-        issued = (item.get("issued") or {}).get("date-parts") or [[None]]
         doi = item.get("DOI", "")
         papers.append(
             {
@@ -115,7 +123,7 @@ def search_crossref(query: str, limit: int, year: int | None = None) -> list[dic
                     " ".join(filter(None, [a.get("given"), a.get("family")]))
                     for a in item.get("author", [])
                 ],
-                "year": issued[0][0] if issued and issued[0] else None,
+                "year": _crossref_year(item),
                 "venue": " ".join(item.get("container-title") or []),
                 "abstract": _JATS_TAG.sub("", item.get("abstract") or "").strip(),
                 "url": f"https://doi.org/{doi}" if doi else item.get("URL", ""),
@@ -195,10 +203,25 @@ def _providers() -> dict:
     return providers
 
 
-def _dedup_key(paper: dict) -> str:
+def _dedup_keys(paper: dict) -> set[str]:
+    # The same paper can appear under several DOIs (e.g. Crossref component
+    # records), so match on the normalized title as well.
+    keys = {"t:" + re.sub(r"\W+", "", paper["title"].lower())}
     if paper.get("doi"):
-        return paper["doi"].lower()
-    return re.sub(r"\W+", "", paper["title"].lower())
+        keys.add("d:" + paper["doi"].lower())
+    return keys
+
+
+class _Merger:
+    def __init__(self):
+        self.papers, self.seen = [], set()
+
+    def add(self, paper: dict) -> None:
+        keys = _dedup_keys(paper)
+        if keys & self.seen:
+            return
+        self.seen |= keys
+        self.papers.append(paper)
 
 
 def search_papers(
@@ -232,16 +255,12 @@ def search_papers(
     _logger.info("search %r (year=%s) -> %s", query, year, status)
 
     # Round-robin across providers so one source can't crowd out the others.
-    merged, seen = [], set()
+    merger = _Merger()
     for i in range(per_source):
         for name in providers:
             if i < len(results[name]):
-                paper = results[name][i]
-                key = _dedup_key(paper)
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(paper)
-    return merged[:limit], status
+                merger.add(results[name][i])
+    return merger.papers[:limit], status
 
 
 def search_many(
@@ -256,31 +275,94 @@ def search_many(
     Titles that don't exist simply return unrelated papers, which the judge
     then fails to verify against their abstracts.
     """
-    searches: list[tuple[str, int | None, dict | None]] = []
+    all_sources = _providers()
+    # OpenAlex meters keyless use with a small budget, so it only gets the
+    # title lookup and the first query; other searches skip it.
+    no_openalex = {k: v for k, v in all_sources.items() if k != "OpenAlex"}
+    searches: list[tuple[str, int | None, dict]] = []
     if known_title.strip():
-        title_sources = {k: v for k, v in _providers().items() if k in ("OpenAlex", "Crossref")}
-        searches.append((known_title, None, title_sources))
+        searches.append((known_title, None, {k: v for k, v in all_sources.items() if k in ("OpenAlex", "Crossref")}))
     queries = [q for q in dict.fromkeys(q.strip() for q in queries) if q]
     if year and queries:
-        searches.append((queries[0], year, None))
-    searches += [(q, None, None) for q in queries]
+        searches.append((queries[0], year, no_openalex))
+    for n, q in enumerate(queries):
+        searches.append((q, None, all_sources if n == 0 else no_openalex))
 
-    merged, seen = [], set()
+    merger = _Merger()
     ok_counts: dict[str, int] = {}
     errors: dict[str, str] = {}
     for query, y, providers in searches:
-        papers, status = search_papers(query, limit=limit, per_source=2 if providers else 3, year=y, providers=providers)
+        papers, status = search_papers(query, limit=limit, per_source=2 if known_title and query == known_title else 3,
+                                       year=y, providers=providers)
         for name, st in status.items():
             if st.startswith("ok"):
                 ok_counts[name] = ok_counts.get(name, 0) + int(re.search(r"\d+", st).group())
             else:
                 errors.setdefault(name, st)
         for paper in papers:
-            key = _dedup_key(paper)
-            if key not in seen:
-                seen.add(key)
-                merged.append(paper)
+            merger.add(paper)
+    merged = merger.papers
 
     status = {name: f"ok ({n}건)" for name, n in ok_counts.items()}
     status.update({name: err for name, err in errors.items() if name not in status})
     return merged[:limit], status
+
+
+def _openalex_abstracts(dois: list[str]) -> dict[str, str]:
+    params = {"filter": "doi:" + "|".join(dois), "per_page": len(dois), "select": "doi,abstract_inverted_index"}
+    if email := _contact_email():
+        params["mailto"] = email
+    if api_key := os.environ.get("OPENALEX_API_KEY"):
+        params["api_key"] = api_key
+    resp = _get(_OPENALEX_API, "OpenAlex", params=params)
+    found = {}
+    for w in resp.json().get("results", []):
+        abstract = _reconstruct_abstract(w.get("abstract_inverted_index"))
+        if abstract and w.get("doi"):
+            found[w["doi"].removeprefix("https://doi.org/").lower()] = abstract
+    return found
+
+
+def _semantic_scholar_abstracts(dois: list[str]) -> dict[str, str]:
+    headers = {"User-Agent": _user_agent()}
+    if api_key := os.environ.get("SEMANTIC_SCHOLAR_API_KEY"):
+        headers["x-api-key"] = api_key
+    try:
+        resp = requests.post(
+            "https://api.semanticscholar.org/graph/v1/paper/batch",
+            params={"fields": "abstract,externalIds"},
+            json={"ids": [f"DOI:{d}" for d in dois]},
+            headers=headers,
+            timeout=_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise SearchError(f"Semantic Scholar 요청 실패: {exc.__class__.__name__}") from exc
+    if resp.status_code != 200:
+        raise SearchError(f"Semantic Scholar HTTP {resp.status_code}")
+    found = {}
+    for p in resp.json():
+        if p and p.get("abstract"):
+            doi = ((p.get("externalIds") or {}).get("DOI") or "").lower()
+            if doi:
+                found[doi] = p["abstract"]
+    return found
+
+
+def fill_missing_abstracts(papers: list[dict]) -> None:
+    """Crossref often has no abstract, and without one nothing can be
+    verified. Look the DOIs up in one batch request per source (OpenAlex,
+    then Semantic Scholar) and fill abstracts in place."""
+    missing = {p["doi"].lower(): p for p in papers if not p.get("abstract") and p.get("doi")}
+    for name, lookup in (("OpenAlex", _openalex_abstracts), ("Semantic Scholar", _semantic_scholar_abstracts)):
+        if not missing:
+            return
+        dois = list(missing)[:50]
+        try:
+            found = lookup(dois)
+        except Exception as exc:
+            _logger.warning("%s abstract lookup failed: %s", name, exc)
+            continue
+        _logger.info("%s abstract lookup: %d/%d found", name, len(found), len(dois))
+        for doi, abstract in found.items():
+            if doi in missing:
+                missing.pop(doi)["abstract"] = abstract

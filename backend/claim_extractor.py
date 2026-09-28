@@ -7,10 +7,13 @@ _MAX_QUERY_TERMS = 6
 _MIN_CLAIM_LEN = 8
 
 # Abbreviations whose trailing period must not end a sentence ("Fig. 1에서 ...").
+# Case-sensitive on purpose: "vs." (versus) is an abbreviation, but the unit
+# "cm²/Vs." at the end of a sentence is not.
 _ABBREVIATIONS = re.compile(
-    r"\b(Fig|Figs|Eq|Eqs|Ref|Refs|al|e\.g|i\.e|vs|cf|approx|No|Tab|Sec|ca)\.",
-    re.IGNORECASE,
+    r"\b(Fig|FIG|fig|Figs|figs|Eq|Eqs|eq|Ref|Refs|ref|al|e\.g|i\.e|vs|cf|approx|No|no|Tab|Sec|ca)\."
 )
+# Numbered claims (①…⑳) always start a new sentence.
+_CIRCLED_NUMBER = re.compile(r"\s*(?=[\u2460-\u2473])")
 _ABBR_MARK = "\u0000"
 
 # "HfO₂" → "HfO2" so the formula survives term extraction intact.
@@ -51,7 +54,7 @@ def split_sentences(text: str) -> list[str]:
     if not text:
         return []
     protected = _ABBREVIATIONS.sub(lambda m: m.group(0)[:-1] + _ABBR_MARK, text)
-    raw = _SENTENCE_SPLIT.split(protected)
+    raw = [part for chunk in _CIRCLED_NUMBER.split(protected) for part in _SENTENCE_SPLIT.split(chunk)]
     sentences = [s.replace(_ABBR_MARK, ".").strip() for s in raw]
     return [s for s in sentences if len(s) >= _MIN_CLAIM_LEN]
 

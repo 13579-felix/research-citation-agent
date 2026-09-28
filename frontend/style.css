@@ -151,3 +151,4 @@ button:disabled { opacity: 0.6; cursor: default; }
 }
 .matched.none { color: var(--muted); font-size: 0.75rem; border-left: none; background: none; padding: 4px 0 0; }
 .matched-source { display: block; color: var(--muted); font-size: 0.7rem; margin-top: 2px; }
+.cond.other_paper .cond-label { color: var(--muted); }
