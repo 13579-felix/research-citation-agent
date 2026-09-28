@@ -9,6 +9,7 @@ const STATUS = {
   partial: { text: "일부 확인", cls: "caution" },
   contradicted: { text: "근거와 모순", cls: "warn" },
   insufficient: { text: "근거 부족", cls: "warn" },
+  unverifiable: { text: "확인 불가 (초록 없음)", cls: "neutral" },
   not_needed: { text: "인용 불필요", cls: "neutral" },
   undetermined: { text: "미판정", cls: "caution" },
   error: { text: "판단 실패", cls: "caution" },
