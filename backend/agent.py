@@ -15,6 +15,8 @@ failures and heuristic mode map to undetermined/error, never supported.
 
 import logging
 import os
+import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
@@ -56,12 +58,16 @@ class CitationPlans(BaseModel):
     plans: list[CitationPlan]
 
 
+class ConditionCheck(BaseModel):
+    condition: str = Field(description="한국어. 주장을 이루는 구체적 조건 하나 (예: 'HZO 두께 5 nm', '2Pr이 10 nm 시료와 같은 수준')")
+    status: Literal["confirmed", "contradicted", "not_mentioned"]
+    paper: int = Field(description="Paper number within this claim whose abstract confirms/contradicts it; 0 if not_mentioned")
+    quote: str = Field(description="Verbatim span copied from that paper's abstract (English, unchanged). Empty if not_mentioned.")
+
+
 class Judgement(BaseModel):
     index: int = Field(description="The claim number given in the input")
-    verdict: Literal["supported", "contradicted", "insufficient"]
-    reason: str = Field(description="한국어 1~2문장. 어떤 논문의 어떤 내용 때문인지 구체적으로.")
-    supporting: list[int] = Field(description="1-based indices of this claim's papers that support it")
-    contradicting: list[int] = Field(description="1-based indices of this claim's papers that contradict it")
+    conditions: list[ConditionCheck]
 
 
 class Judgements(BaseModel):
@@ -152,37 +158,92 @@ def _judge_with_llm(client, claims: list[tuple[str, list[dict]]]) -> dict[int, J
     result = _parse(
         client,
         Judgements,
-        "너는 연구 글의 인용 근거를 검증하는 심사자다. 각 주장 문장을 그 주장에 딸린 후보 논문"
-        "(초록 전문)과 대조하라. 주장마다 번호(index)를 그대로 써서 하나씩 판정하고, 논문 번호는 "
-        "그 주장 안에서의 번호를 쓴다.\n\n"
-        "판정 기준:\n"
-        "- supported: 적어도 한 논문의 초록이 이 주장의 핵심 내용(대상 재료·소자, 조건, 방향, "
-        "수치)을 직접 뒷받침한다.\n"
-        "- contradicted: 한 논문이라도 주장과 상충하는 결과를 보고한다. 예: 주장은 '5 nm에서도 "
-        "동일한 2Pr'인데 초록은 두께 감소에 따른 2Pr 감소를 보고함. 수치·경향·조건이 다르면 "
-        "모순으로 본다. 뒷받침하는 논문이 함께 있어도 모순이 있으면 contradicted.\n"
-        "- insufficient: 주제는 관련 있어도 주장의 구체적 내용(특히 수치·조건)을 확인할 수 없다. "
-        "키워드만 겹치는 논문, 다른 재료계 논문, 초록이 없는 논문은 근거가 아니다.\n"
-        "확신이 없으면 supported가 아니라 insufficient로 판정하라.\n\n"
+        "너는 연구 글의 인용 근거를 검증하는 엄격한 심사자다. 각 주장 문장을 그 주장에 딸린 후보 "
+        "논문의 초록과 대조하라. 주장마다 번호(index)를 그대로 쓰고, 논문 번호는 그 주장 안에서의 "
+        "번호를 쓴다.\n\n"
+        "절차:\n"
+        "1) 주장을 검증 가능한 구체적 조건으로 모두 나눠라: 대상 재료·소자, 두께 등 치수, 수치, "
+        "비교 대상('~와 같은 수준', '~보다 높다'), 공정 조건(온도·방법), 연도·최초 여부 등. "
+        "비교 표현은 그 비교 자체를 하나의 조건으로 둔다.\n"
+        "2) 각 조건마다 초록에 그 조건이 명시돼 있으면 confirmed, 초록이 반대 결과(다른 수치, 반대 "
+        "경향, 다른 조건에서만 성립)를 보고하면 contradicted, 명시돼 있지 않으면 not_mentioned.\n"
+        "3) confirmed/contradicted에는 해당 초록에서 그대로 복사한 문구(quote)를 반드시 넣어라. "
+        "문구를 바꾸거나 요약하거나 번역하지 마라. 복사할 문구가 없으면 not_mentioned다.\n"
+        "추론·배경지식·키워드 겹침으로 confirmed 처리하지 마라. 초록에 직접 쓰여 있는 것만 인정한다.\n\n"
         + "\n\n".join(blocks),
     )
     return {j.index: j for j in result.judgements}
 
 
-def _result(sentence, query, papers, status, reason, search_status=None, supporting=(), contradicting=()):
+_NON_WORD = re.compile(r"[\W_]+")
+
+
+def _normalize(text: str) -> str:
+    return _NON_WORD.sub(" ", unicodedata.normalize("NFKC", text).lower()).strip()
+
+
+_STATUS_LABEL = {"confirmed": "확인", "contradicted": "모순", "not_mentioned": "확인 안 됨"}
+
+
+def _verdict_from(judgement: Judgement, papers: list[dict]):
+    """Decide the verdict in code from quote-verified conditions.
+
+    The model's word alone never makes a claim "supported": each
+    confirmed/contradicted condition must carry a quote that actually
+    occurs in the cited paper's abstract, otherwise it is downgraded to
+    "not mentioned". Supported needs every condition confirmed.
+    """
+    checks, supporting, contradicting = [], set(), set()
+    for c in judgement.conditions:
+        status = c.status
+        if status != "not_mentioned":
+            abstract = papers[c.paper - 1]["abstract"] if 1 <= c.paper <= len(papers) else ""
+            quote = _normalize(c.quote)
+            if len(quote) < 8 or quote not in _normalize(abstract):
+                status = "not_mentioned"
+        if status == "confirmed":
+            supporting.add(c.paper)
+        elif status == "contradicted":
+            contradicting.add(c.paper)
+        checks.append({
+            "condition": c.condition,
+            "status": status,
+            "label": _STATUS_LABEL[status],
+            "paper": c.paper if status != "not_mentioned" else None,
+            "quote": c.quote if status != "not_mentioned" else "",
+        })
+
+    def names(status):
+        return ", ".join(ch["condition"] for ch in checks if ch["status"] == status)
+
+    if contradicting:
+        verdict = "contradicted"
+        reason = f"초록과 상충하는 조건이 있습니다: {names('contradicted')}."
+    elif checks and all(ch["status"] == "confirmed" for ch in checks):
+        verdict = "supported"
+        reason = "주장의 모든 조건이 후보 논문 초록에서 원문 인용으로 확인되었습니다."
+    else:
+        verdict = "insufficient"
+        missing = names("not_mentioned") or "주장의 구체적 조건"
+        reason = f"초록에서 확인되지 않은 조건이 있습니다: {missing}. 이 부분의 근거를 보완하거나 표현을 수정하세요."
+    return verdict, reason, checks, supporting, contradicting
+
+
+def _result(sentence, query, papers, status, reason, search_status=None, supporting=(), contradicting=(), conditions=()):
     return {
         "sentence": sentence,
         "query": query,
         "papers": [
             {
                 **{k: v for k, v in p.items() if k != "abstract"},
-                "role": "supporting" if i in supporting else "contradicting" if i in contradicting else None,
+                "role": "contradicting" if i in contradicting else "supporting" if i in supporting else None,
             }
             for i, p in enumerate(papers, 1)
         ],
         "status": status,
         "reason": reason,
         "search_status": search_status or {},
+        "conditions": list(conditions),
     }
 
 
@@ -280,9 +341,10 @@ def _analyze_agentic(client, sentences: list[str]) -> list[dict]:
                 reason = f"근거 판단에 실패했습니다 ({failure or '모델 응답에 이 문장이 빠짐'}). 후보 논문을 직접 확인하세요."
                 results[i] = _result(sentence, query, papers, "error", reason, search_status)
             else:
+                verdict, reason, checks, supporting, contradicting = _verdict_from(j, papers)
                 results[i] = _result(
-                    sentence, query, papers, j.verdict, j.reason, search_status,
-                    supporting=set(j.supporting), contradicting=set(j.contradicting),
+                    sentence, query, papers, verdict, reason, search_status,
+                    supporting=supporting, contradicting=contradicting, conditions=checks,
                 )
     return results
 
