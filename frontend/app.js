@@ -35,11 +35,12 @@ async function loadStatus() {
   }
 }
 
-function paperHTML(p) {
+function paperHTML(p, i) {
   const authors = p.authors.slice(0, 3).join(", ") + (p.authors.length > 3 ? " 외" : "");
   const role = p.role === "supporting" ? "근거" : p.role === "contradicting" ? "모순" : "";
   return `
     <div class="paper ${p.role || ""}">
+      <span class="paper-num">(${i + 1})</span>
       ${role ? `<span class="paper-role">${role}</span>` : ""}
       <a href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">${esc(p.title)}</a>
       <div class="paper-meta">${esc(authors)} · ${esc(p.year ?? "연도 미상")} ${p.venue ? "· " + esc(p.venue) : ""} · ${esc(p.provider)}</div>
@@ -59,11 +60,21 @@ function searchStatusHTML(status) {
   return `<div class="search-status" title="${esc(title)}">검색: ${parts.join(" · ")}</div>`;
 }
 
+function conditionsHTML(conditions) {
+  if (!conditions || !conditions.length) return "";
+  const rows = conditions.map((c) => `
+    <li class="cond ${esc(c.status)}">
+      <span class="cond-label">${esc(c.label)}</span> ${esc(c.condition)}
+      ${c.quote ? `<div class="cond-quote">“${esc(c.quote)}” — 논문 (${esc(c.paper)})</div>` : ""}
+    </li>`).join("");
+  return `<ul class="conditions">${rows}</ul>`;
+}
+
 function cardHTML(item) {
   const status = STATUS[item.status] || STATUS.error;
   let papers = "";
   if (item.papers.length) {
-    papers = item.papers.map(paperHTML).join("");
+    papers = item.papers.map((p, i) => paperHTML(p, i)).join("");
   } else if (item.query) {
     papers = `<div class="paper-meta">검색된 선행연구가 없습니다. 검색어: "${esc(item.query)}"</div>`;
   }
@@ -73,6 +84,7 @@ function cardHTML(item) {
       <span class="status-pill ${status.cls}">${status.text}</span>
       <div class="claim-sentence">${esc(item.sentence)}</div>
       <div class="reason">${esc(item.reason)}</div>
+      ${conditionsHTML(item.conditions)}
       ${papers}
       ${item.papers.length && item.query ? `<div class="paper-meta">검색어: ${esc(item.query)}</div>` : ""}
       ${searchStatusHTML(item.search_status)}
