@@ -12,3 +12,7 @@ services:
         value: claude-sonnet-5
       - key: OPENALEX_MAILTO
         sync: false
+      - key: OPENALEX_API_KEY
+        sync: false
+      - key: SEMANTIC_SCHOLAR_API_KEY
+        sync: false

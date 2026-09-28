@@ -35,4 +35,5 @@ def status():
 
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
-    return {"results": analyze_draft(req.text), "agentic_mode": agentic_mode_enabled()}
+    results, truncated = analyze_draft(req.text)
+    return {"results": results, "truncated": truncated, "agentic_mode": agentic_mode_enabled()}
