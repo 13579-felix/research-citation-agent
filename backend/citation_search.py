@@ -15,6 +15,8 @@ _S2_FIELDS = "title,authors,year,venue,abstract,url,externalIds"
 _ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
 _TIMEOUT = 10
 _logger = logging.getLogger("citation_search")
+# Crossref/OpenAlex titles and abstracts can carry markup like <sub>2</sub>.
+_JATS_TAG = re.compile(r"<[^>]+>")
 
 
 class SearchError(Exception):
@@ -72,7 +74,7 @@ def search_openalex(query: str, limit: int) -> list[dict]:
         source = w.get("primary_location") or {}
         papers.append(
             {
-                "title": w.get("display_name") or "(제목 없음)",
+                "title": _JATS_TAG.sub("", w.get("display_name") or "") or "(제목 없음)",
                 "authors": [
                     a.get("author", {}).get("display_name", "")
                     for a in w.get("authorships", [])
@@ -86,9 +88,6 @@ def search_openalex(query: str, limit: int) -> list[dict]:
             }
         )
     return papers
-
-
-_JATS_TAG = re.compile(r"<[^>]+>")
 
 
 def search_crossref(query: str, limit: int) -> list[dict]:
@@ -107,7 +106,7 @@ def search_crossref(query: str, limit: int) -> list[dict]:
         doi = item.get("DOI", "")
         papers.append(
             {
-                "title": " ".join(item.get("title") or []) or "(제목 없음)",
+                "title": _JATS_TAG.sub("", " ".join(item.get("title") or [])) or "(제목 없음)",
                 "authors": [
                     " ".join(filter(None, [a.get("given"), a.get("family")]))
                     for a in item.get("author", [])

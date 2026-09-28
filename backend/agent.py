@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from pydantic import BaseModel, Field
 
 from citation_search import search_papers
@@ -29,6 +29,10 @@ from claim_extractor import build_query, looks_self_referential, split_sentences
 # available), so the app keeps working when older model versions retire.
 # Override with GEMINI_MODEL to pin a specific version.
 _GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+# Tried when the main model is overloaded (503) or out of free quota (429).
+# Free-tier quota is counted per model, so this also buys extra requests.
+# Set GEMINI_FALLBACK_MODEL to an empty string to disable.
+_GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-latest")
 _MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "30"))
 _SEARCH_WORKERS = 4
 # The Gemini free tier allows ~5 requests/minute, so sentences are sent to
@@ -82,7 +86,7 @@ def _get_client():
             timeout=60_000,  # ms
             # The free tier has a low requests-per-minute cap; back off on 429.
             retry_options=types.HttpRetryOptions(
-                attempts=3, initial_delay=5.0, max_delay=40.0, http_status_codes=[429, 500, 503]
+                attempts=2, initial_delay=5.0, max_delay=30.0, http_status_codes=[429, 500, 503]
             ),
         ),
     )
@@ -93,9 +97,9 @@ def agentic_mode_enabled() -> bool:
     return _get_client() is not None
 
 
-def _parse(client, schema: type[BaseModel], prompt: str):
+def _generate(client, model: str, schema: type[BaseModel], prompt: str):
     response = client.models.generate_content(
-        model=_GEMINI_MODEL,
+        model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -107,6 +111,16 @@ def _parse(client, schema: type[BaseModel], prompt: str):
         finish = response.candidates[0].finish_reason if response.candidates else response.prompt_feedback
         raise RuntimeError(f"구조화된 응답을 받지 못했습니다 ({finish})")
     return response.parsed
+
+
+def _parse(client, schema: type[BaseModel], prompt: str):
+    try:
+        return _generate(client, _GEMINI_MODEL, schema, prompt)
+    except errors.APIError as exc:
+        if exc.code not in (429, 503) or not _GEMINI_FALLBACK_MODEL:
+            raise
+        _logger.warning("%s unavailable (%s), falling back to %s", _GEMINI_MODEL, exc.code, _GEMINI_FALLBACK_MODEL)
+        return _generate(client, _GEMINI_FALLBACK_MODEL, schema, prompt)
 
 
 def _plan_with_llm(client, sentences: list[str]) -> dict[int, CitationPlan]:
