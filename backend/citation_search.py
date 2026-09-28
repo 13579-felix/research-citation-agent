@@ -61,8 +61,10 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str:
     return " ".join(positions[i] for i in sorted(positions))
 
 
-def search_openalex(query: str, limit: int) -> list[dict]:
+def search_openalex(query: str, limit: int, year: int | None = None) -> list[dict]:
     params = {"search": query, "per_page": limit}
+    if year:
+        params["filter"] = f"publication_year:{year - 1}-{year + 1}"
     if email := _contact_email():
         params["mailto"] = email
     if api_key := os.environ.get("OPENALEX_API_KEY"):
@@ -90,12 +92,14 @@ def search_openalex(query: str, limit: int) -> list[dict]:
     return papers
 
 
-def search_crossref(query: str, limit: int) -> list[dict]:
+def search_crossref(query: str, limit: int, year: int | None = None) -> list[dict]:
     params = {
         "query.bibliographic": query,
         "rows": limit,
         "select": "DOI,title,author,issued,container-title,abstract,URL",
     }
+    if year:
+        params["filter"] = f"from-pub-date:{year - 1},until-pub-date:{year + 1}"
     if email := _contact_email():
         params["mailto"] = email
     resp = _get(_CROSSREF_API, "Crossref", params=params)
@@ -122,7 +126,7 @@ def search_crossref(query: str, limit: int) -> list[dict]:
     return papers
 
 
-def search_arxiv(query: str, limit: int) -> list[dict]:
+def search_arxiv(query: str, limit: int, year: int | None = None) -> list[dict]:
     # "all:FeFET all:HZO" would OR the terms; AND them so every term matters.
     search_query = " AND ".join(f"all:{t}" for t in query.split())
     resp = _get(_ARXIV_API, "arXiv", params={"search_query": search_query, "max_results": limit})
@@ -153,11 +157,13 @@ def search_arxiv(query: str, limit: int) -> list[dict]:
     return papers
 
 
-def search_semantic_scholar(query: str, limit: int) -> list[dict]:
+def search_semantic_scholar(query: str, limit: int, year: int | None = None) -> list[dict]:
     """Only used when SEMANTIC_SCHOLAR_API_KEY is set: the keyless shared
     pool returns 429 too often to be useful (see git history)."""
     headers = {"x-api-key": os.environ["SEMANTIC_SCHOLAR_API_KEY"]}
     params = {"query": query, "limit": limit, "fields": _S2_FIELDS}
+    if year:
+        params["year"] = f"{year - 1}-{year + 1}"
     resp = _get(_S2_API, "Semantic Scholar", params=params, headers=headers)
 
     papers = []
@@ -195,20 +201,23 @@ def _dedup_key(paper: dict) -> str:
     return re.sub(r"\W+", "", paper["title"].lower())
 
 
-def search_papers(query: str, limit: int = 6, per_source: int = 3) -> tuple[list[dict], dict[str, str]]:
+def search_papers(
+    query: str, limit: int = 6, per_source: int = 3, year: int | None = None, providers: dict | None = None
+) -> tuple[list[dict], dict[str, str]]:
     """Search every provider in parallel.
 
     Returns (papers, status) where status maps provider name to "ok (N건)"
     or an error message, so a silently failing provider (e.g. OpenAlex
     returning nothing on the deploy server) is visible in the UI and logs
-    instead of looking like "no papers exist".
+    instead of looking like "no papers exist". With `year`, results are
+    limited to year±1 on providers that support it.
     """
     if not query.strip():
         return [], {}
 
-    providers = _providers()
+    providers = providers or _providers()
     with ThreadPoolExecutor(max_workers=len(providers)) as pool:
-        futures = {name: pool.submit(fn, query, per_source) for name, fn in providers.items()}
+        futures = {name: pool.submit(fn, query, per_source, year) for name, fn in providers.items()}
 
     results: dict[str, list[dict]] = {}
     status: dict[str, str] = {}
@@ -220,7 +229,7 @@ def search_papers(query: str, limit: int = 6, per_source: int = 3) -> tuple[list
             results[name] = []
             status[name] = str(exc) if isinstance(exc, SearchError) else f"{name} 오류: {exc}"
             _logger.warning("%s search failed for %r: %s", name, query, exc)
-    _logger.info("search %r -> %s", query, status)
+    _logger.info("search %r (year=%s) -> %s", query, year, status)
 
     # Round-robin across providers so one source can't crowd out the others.
     merged, seen = [], set()
@@ -232,4 +241,46 @@ def search_papers(query: str, limit: int = 6, per_source: int = 3) -> tuple[list
                 if key not in seen:
                     seen.add(key)
                     merged.append(paper)
+    return merged[:limit], status
+
+
+def search_many(
+    queries: list[str], year: int | None = None, known_title: str = "", limit: int = 8
+) -> tuple[list[dict], dict[str, str]]:
+    """Several searches for one claim, merged in priority order:
+
+    1. an exact-title lookup when the planner named a well-known paper
+       (keyword queries often miss it, e.g. "HfO2" vs "hafnium oxide"),
+    2. the first query restricted to the year the claim mentions,
+    3. every keyword query.
+    Titles that don't exist simply return unrelated papers, which the judge
+    then fails to verify against their abstracts.
+    """
+    searches: list[tuple[str, int | None, dict | None]] = []
+    if known_title.strip():
+        title_sources = {k: v for k, v in _providers().items() if k in ("OpenAlex", "Crossref")}
+        searches.append((known_title, None, title_sources))
+    queries = [q for q in dict.fromkeys(q.strip() for q in queries) if q]
+    if year and queries:
+        searches.append((queries[0], year, None))
+    searches += [(q, None, None) for q in queries]
+
+    merged, seen = [], set()
+    ok_counts: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    for query, y, providers in searches:
+        papers, status = search_papers(query, limit=limit, per_source=2 if providers else 3, year=y, providers=providers)
+        for name, st in status.items():
+            if st.startswith("ok"):
+                ok_counts[name] = ok_counts.get(name, 0) + int(re.search(r"\d+", st).group())
+            else:
+                errors.setdefault(name, st)
+        for paper in papers:
+            key = _dedup_key(paper)
+            if key not in seen:
+                seen.add(key)
+                merged.append(paper)
+
+    status = {name: f"ok ({n}건)" for name, n in ok_counts.items()}
+    status.update({name: err for name, err in errors.items() if name not in status})
     return merged[:limit], status

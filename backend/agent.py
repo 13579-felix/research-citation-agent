@@ -2,7 +2,8 @@
 
 Every sentence ends in exactly one status:
 
-- supported     근거 확인: a candidate paper's abstract backs the claim
+- supported     근거 확인: every condition of the claim is confirmed by a verified quote
+- partial       일부 확인: some conditions confirmed, none contradicted, others unverified
 - contradicted  근거와 모순: a candidate paper reports something that conflicts
 - insufficient  근거 부족: candidates don't back the claim (or none were found)
 - not_needed    인용 불필요: the sentence describes this work, not prior findings
@@ -24,7 +25,7 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
-from citation_search import search_papers
+from citation_search import search_many, search_papers
 from claim_extractor import build_query, looks_self_referential, split_sentences
 
 # "gemini-flash-latest" tracks Google's current Flash model (free tier
@@ -51,7 +52,14 @@ class CitationPlan(BaseModel):
         description="True if the sentence states a fact/result from prior literature that a reader would expect to be cited."
     )
     reason: str = Field(description="한국어 한 문장 이유")
-    query: str = Field(description="English search query, 3-6 specific technical keywords. Empty if needs_citation is false.")
+    queries: list[str] = Field(
+        description="1-3 English search queries (3-6 keywords each). Include one variant with chemical names spelled out "
+        "(e.g. 'hafnium oxide' for HfO2). Empty if needs_citation is false."
+    )
+    year: int = Field(description="Publication/report year stated in the sentence (e.g. 2011), else 0")
+    known_title: str = Field(
+        description="Exact title of the well-known original paper for this claim, only if you are certain; else empty"
+    )
 
 
 class CitationPlans(BaseModel):
@@ -145,8 +153,11 @@ def _plan_with_llm(client, sentences: list[str]) -> dict[int, CitationPlan]:
         "서술하면 인용이 필요하다. 본 연구의 목적·방법·계획을 서술하거나, 글의 구성을 안내하는 "
         "문장은 인용이 필요 없다.\n"
         "2) 인용이 필요하면, OpenAlex/Crossref/arXiv에서 이 주장을 검증할 논문을 찾기 위한 "
-        "영어 검색 쿼리(구체적인 재료·소자·공정 용어 3~6개)를 만들어라. 'Si', 'Zr' 같은 "
-        "단일 원소 기호만으로 된 일반적인 쿼리는 피하라.\n\n"
+        "영어 검색 쿼리를 1~3개 만들어라(각 3~6개 구체적 용어). 논문 제목은 화학식 대신 이름을 쓰는 "
+        "경우가 많으니 하나는 이름으로 풀어 써라(HfO2 → hafnium oxide, HZO → hafnium zirconium oxide). "
+        "'Si', 'Zr' 같은 단일 원소 기호만으로 된 쿼리는 피하라.\n"
+        "3) 문장에 연도가 있으면 year에, 이 주장의 원 출처로 널리 알려진 논문 제목을 확실히 알면 "
+        "known_title에 정확히 적어라. 확실하지 않으면 비워라.\n\n"
         f"문장 목록:\n{numbered}",
     )
     return {plan.index: plan for plan in result.plans}
@@ -176,6 +187,9 @@ def _judge_with_llm(client, claims: list[tuple[str, list[dict]]]) -> dict[int, J
         "3) confirmed/contradicted에는 해당 초록에서 그대로 복사한 문구(quote)를 반드시 넣어라. "
         "문구를 바꾸거나 요약하거나 번역하지 마라. 복사할 문구가 없으면 not_mentioned다.\n"
         "추론·배경지식·키워드 겹침으로 confirmed 처리하지 마라. 초록에 직접 쓰여 있는 것만 인정한다.\n"
+        "단, 제목과 출판 연도도 근거로 쓸 수 있다: 제목에서 확인되면 제목 일부를 그대로 quote로, 연도 "
+        "조건(예: 2011년 보고)은 그 논문의 출판 연도가 맞을 때 quote에 연도 숫자만(예: 2011) 넣어라. "
+        "'최초' 같은 주장은 초록·제목에 first 등으로 명시된 경우에만 confirmed.\n"
         "4) matches: 후보 논문마다, 그 초록에서 주장과 가장 관련 깊은 문장 하나를 한 문장 전체 그대로 "
         "복사하라(바꾸거나 줄이지 말 것). 초록이 없으면 빈 문자열.\n\n"
         + "\n\n".join(blocks),
@@ -241,9 +255,13 @@ def _verdict_from(judgement: Judgement, papers: list[dict]):
     for c in judgement.conditions:
         status = c.status
         if status != "not_mentioned":
-            abstract = papers[c.paper - 1]["abstract"] if 1 <= c.paper <= len(papers) else ""
+            paper = papers[c.paper - 1] if 1 <= c.paper <= len(papers) else {}
             quote = _normalize(c.quote)
-            if len(quote) < 8 or quote not in _normalize(abstract):
+            is_year = quote.isdigit() and len(quote) == 4 and quote == str(paper.get("year"))
+            in_text = len(quote) >= 8 and (
+                quote in _normalize(paper.get("abstract") or "") or quote in _normalize(paper.get("title") or "")
+            )
+            if not (is_year or in_text):
                 status = "not_mentioned"
         if status == "confirmed":
             supporting.add(c.paper)
@@ -266,6 +284,12 @@ def _verdict_from(judgement: Judgement, papers: list[dict]):
     elif checks and all(ch["status"] == "confirmed" for ch in checks):
         verdict = "supported"
         reason = "주장의 모든 조건이 후보 논문 초록에서 원문 인용으로 확인되었습니다."
+    elif any(ch["status"] == "confirmed" for ch in checks):
+        verdict = "partial"
+        reason = (
+            f"일부 조건만 원문으로 확인되었습니다. 확인됨: {names('confirmed')}. "
+            f"확인 안 됨: {names('not_mentioned')}. 확인 안 된 부분의 근거를 보완하거나 표현을 조정하세요."
+        )
     else:
         verdict = "insufficient"
         missing = names("not_mentioned") or "주장의 구체적 조건"
@@ -335,16 +359,19 @@ def _analyze_heuristic(sentence: str) -> dict:
 
 
 def _search_for(sentence: str, plan: CitationPlan | None):
-    """Returns (query, papers, search_status)."""
+    """Returns (query label, papers, search_status)."""
     fallback = build_query(sentence)
-    query = (plan.query.strip() if plan else "") or fallback
-    if not query:
+    queries = [q for q in (plan.queries if plan else []) if q.strip()] or ([fallback] if fallback else [])
+    if not queries:
         return "", [], {}
-    papers, search_status = search_papers(query)
-    if not papers and fallback and fallback != query:
-        query = fallback
-        papers, search_status = search_papers(query)
-    return query, papers, search_status
+    year = plan.year if plan and 1900 < plan.year < 2100 else None
+    known_title = plan.known_title if plan else ""
+    papers, search_status = search_many(queries, year=year, known_title=known_title)
+    if not papers and fallback and fallback not in queries:
+        queries = [fallback]
+        papers, search_status = search_many(queries)
+    label = " | ".join(queries) + (f" | 제목: {known_title}" if known_title else "") + (f" | {year}년" if year else "")
+    return label, papers, search_status
 
 
 def _analyze_agentic(client, sentences: list[str]) -> list[dict]:

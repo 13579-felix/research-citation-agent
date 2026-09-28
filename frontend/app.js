@@ -6,6 +6,7 @@ const modeBadge = document.getElementById("mode-badge");
 // Must match the statuses produced by backend/agent.py.
 const STATUS = {
   supported: { text: "근거 확인", cls: "ok" },
+  partial: { text: "일부 확인", cls: "caution" },
   contradicted: { text: "근거와 모순", cls: "warn" },
   insufficient: { text: "근거 부족", cls: "warn" },
   not_needed: { text: "인용 불필요", cls: "neutral" },
