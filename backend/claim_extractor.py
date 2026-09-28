@@ -30,7 +30,7 @@ _MIN_TERM_LEN = 3
 _INLINE_CITATION = re.compile(r"\([^()]*(?:et al\.?|\d{4})[^()]*\)|\[\d+(?:[,\-–]\s*\d+)*\]")
 
 # Sentences describing the author's own work/plan rather than making a claim
-# about prior literature. Used only in heuristic mode (Claude decides otherwise).
+# about prior literature. Used only in heuristic mode (the LLM decides otherwise).
 _SELF_REFERENCE = re.compile(r"(본\s*연구|본\s*논문|본\s*과제|우리는|우리\s*연구|본\s*실험)")
 
 

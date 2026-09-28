@@ -28,8 +28,8 @@ async function loadStatus() {
     const res = await fetch("/api/status");
     const data = await res.json();
     modeBadge.textContent = data.agentic_mode
-      ? "Agentic 모드 (Claude가 인용 필요 여부·근거·모순 판단)"
-      : "휴리스틱 모드 (ANTHROPIC_API_KEY 미설정 — 근거 판단 안 함)";
+      ? "Agentic 모드 (Gemini가 인용 필요 여부·근거·모순 판단)"
+      : "휴리스틱 모드 (GEMINI_API_KEY 미설정 — 근거 판단 안 함)";
   } catch {
     modeBadge.textContent = "상태 확인 실패";
   }

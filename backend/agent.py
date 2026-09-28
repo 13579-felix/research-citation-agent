@@ -18,16 +18,20 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
-import anthropic
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 
 from citation_search import search_papers
 from claim_extractor import build_query, looks_self_referential, split_sentences
 
-_ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+# "gemini-flash-latest" tracks Google's current Flash model (free tier
+# available), so the app keeps working when older model versions retire.
+# Override with GEMINI_MODEL to pin a specific version.
+_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 _MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "30"))
 _SENTENCE_WORKERS = 4
-_anthropic_client = None
+_gemini_client = None
 _logger = logging.getLogger("agent")
 
 
@@ -47,41 +51,51 @@ class Judgement(BaseModel):
 
 
 def _get_client():
-    """Lazily build an Anthropic client if an API key is configured.
+    """Lazily build a Gemini client if an API key is configured.
 
     The app runs without one (heuristic mode) so a missing key never
     blocks the demo, but in that mode nothing is ever marked "supported".
     """
-    global _anthropic_client
-    if _anthropic_client is not None:
-        return _anthropic_client
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return None
-    _anthropic_client = anthropic.Anthropic(api_key=api_key)
-    return _anthropic_client
+    _gemini_client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=60_000,  # ms
+            # The free tier has a low requests-per-minute cap; back off on 429.
+            retry_options=types.HttpRetryOptions(
+                attempts=4, initial_delay=2.0, max_delay=30.0, http_status_codes=[429, 500, 503]
+            ),
+        ),
+    )
+    return _gemini_client
 
 
 def agentic_mode_enabled() -> bool:
     return _get_client() is not None
 
 
-def _parse(client, schema: type[BaseModel], prompt: str, effort: str):
-    response = client.messages.parse(
-        model=_ANTHROPIC_MODEL,
-        max_tokens=4000,
-        output_config={"effort": effort},
-        output_format=schema,
-        messages=[{"role": "user", "content": prompt}],
+def _parse(client, schema: type[BaseModel], prompt: str):
+    response = client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        ),
     )
-    if response.stop_reason == "refusal":
-        raise RuntimeError("모델이 응답을 거부했습니다")
-    if response.stop_reason == "max_tokens" or response.parsed_output is None:
-        raise RuntimeError(f"구조화된 응답을 받지 못했습니다 (stop_reason={response.stop_reason})")
-    return response.parsed_output
+    if not isinstance(response.parsed, schema):
+        finish = response.candidates[0].finish_reason if response.candidates else response.prompt_feedback
+        raise RuntimeError(f"구조화된 응답을 받지 못했습니다 ({finish})")
+    return response.parsed
 
 
-def _plan_with_claude(client, sentence: str) -> CitationPlan:
+def _plan_with_llm(client, sentence: str) -> CitationPlan:
     return _parse(
         client,
         CitationPlan,
@@ -93,11 +107,10 @@ def _plan_with_claude(client, sentence: str) -> CitationPlan:
         "영어 검색 쿼리(구체적인 재료·소자·공정 용어 3~6개)를 만들어라. 'Si', 'Zr' 같은 "
         "단일 원소 기호만으로 된 일반적인 쿼리는 피하라.\n\n"
         f"문장: {sentence}",
-        effort="low",
     )
 
 
-def _judge_with_claude(client, sentence: str, papers: list[dict]) -> Judgement:
+def _judge_with_llm(client, sentence: str, papers: list[dict]) -> Judgement:
     paper_block = "\n\n".join(
         f"[{i}] {p['title']} ({p['year'] or '연도 미상'}, {p['venue'] or p['provider']})\n"
         f"초록: {p['abstract'] or '(초록 없음 — 제목만으로는 근거로 인정하지 말 것)'}"
@@ -117,7 +130,6 @@ def _judge_with_claude(client, sentence: str, papers: list[dict]) -> Judgement:
         "키워드만 겹치는 논문, 다른 재료계 논문, 초록이 없는 논문은 근거가 아니다.\n"
         "확신이 없으면 supported가 아니라 insufficient로 판정하라.\n\n"
         f"주장: {sentence}\n\n후보 논문:\n{paper_block}",
-        effort="medium",
     )
 
 
@@ -155,7 +167,7 @@ def _analyze_heuristic(sentence: str) -> dict:
         return _result(
             sentence, "", [], "undetermined",
             "검색어로 쓸 구체적인 영문 전문용어가 없어 검색하지 않았습니다. "
-            "ANTHROPIC_API_KEY를 설정하면 Claude가 검색어를 생성합니다.",
+            "GEMINI_API_KEY를 설정하면 Gemini가 검색어를 생성합니다.",
         )
     papers, search_status = search_papers(query)
     if not papers:
@@ -169,7 +181,7 @@ def _analyze_heuristic(sentence: str) -> dict:
 
 def _analyze_agentic(client, sentence: str) -> dict:
     try:
-        plan = _plan_with_claude(client, sentence)
+        plan = _plan_with_llm(client, sentence)
     except Exception as exc:
         _logger.warning("citation planning failed for %r: %s", sentence, exc)
         plan = None
@@ -190,12 +202,12 @@ def _analyze_agentic(client, sentence: str) -> dict:
         return _no_papers(sentence, query, search_status)
 
     try:
-        judgement = _judge_with_claude(client, sentence, papers)
+        judgement = _judge_with_llm(client, sentence, papers)
     except Exception as exc:
         _logger.warning("judgement failed for %r: %s", sentence, exc)
         return _result(
             sentence, query, papers, "error",
-            f"근거 판단에 실패했습니다 ({exc.__class__.__name__}). 후보 논문을 직접 확인하세요.",
+            f"근거 판단에 실패했습니다 ({str(exc)[:150]}). 후보 논문을 직접 확인하세요.",
             search_status,
         )
     return _result(
