@@ -1,7 +1,9 @@
 import re
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
-_LATIN_TERM = re.compile(r"[A-Za-z][A-Za-z0-9\-]{1,}")
+# Allows decimals inside formulas so "Hf0.5Zr0.5O2" stays one term.
+_LATIN_TERM = re.compile(r"\d*[A-Za-z][A-Za-z0-9\-]*(?:\.\d+[A-Za-z0-9\-]*)*")
+_MAX_QUERY_TERMS = 6
 _MIN_CLAIM_LEN = 8
 
 # Abbreviations whose trailing period must not end a sentence ("Fig. 1에서 ...").
@@ -22,6 +24,16 @@ _GENERIC_TERMS = {
     "ma", "ua", "na", "pa", "mpa", "gpa", "sec", "ms", "us", "ns", "min",
     "the", "and", "for", "with", "via", "of", "in", "on", "by", "to", "is",
     "vs", "et", "al", "fig", "figs", "eq", "ref", "table",
+    # English function words / filler, for drafts written in English.
+    "a", "an", "as", "at", "be", "been", "being", "are", "was", "were", "has", "have",
+    "had", "its", "it", "this", "that", "these", "those", "their", "there", "which",
+    "who", "from", "into", "than", "then", "also", "only", "even", "such", "can",
+    "could", "may", "might", "will", "would", "should", "not", "but", "or", "due",
+    "our", "we", "study", "work", "paper", "here", "show", "shows", "shown", "reported",
+    "first", "same", "level", "making", "make", "around", "about", "using", "used",
+    "based", "while", "both", "more", "most", "very", "well", "high", "low", "new",
+    "known", "attracting", "attention", "apply", "applied", "compatible", "exhibits",
+    "originates", "achieve", "achieves", "samples", "sample", "thick", "thin",
 }
 _MIN_TERM_LEN = 3
 
@@ -57,10 +69,16 @@ def build_query(sentence: str) -> str:
     """
     normalized = _INLINE_CITATION.sub(" ", sentence.translate(_SUBSCRIPTS))
     terms = [
-        t
+        t.rstrip(".-")
         for t in dict.fromkeys(_LATIN_TERM.findall(normalized))
         if len(t) >= _MIN_TERM_LEN and t.lower() not in _GENERIC_TERMS
     ]
+    if len(terms) > _MAX_QUERY_TERMS:
+        # Mostly-English sentence: prefer technical-looking terms
+        # (acronyms, formulas, mixed case) over ordinary words.
+        technical = [t for t in terms if not t.islower()]
+        ordinary = [t for t in terms if t.islower()]
+        terms = (technical + ordinary)[:_MAX_QUERY_TERMS]
     return " ".join(terms)
 
 
